@@ -49,20 +49,26 @@
     })
   });
 
-  /** Testing: no odds bracket, low spike bar, alerts even with open paper trade */
-  const SPIKE_ALERT_TESTING = true;
+  const PAPER_TRADING_ENABLED = false;
+  const DEMO_TRADING_ENABLED = true;
 
-  const MEMORY_DEPTH = SPIKE_ALERT_TESTING ? 2 : BRACKET.MEMORY_DEPTH;
-  const SPIKE_COOLDOWN_MS = SPIKE_ALERT_TESTING ? 3000 : BRACKET.SPIKE_COOLDOWN_MS;
-  const SPIKE_TEST_MIN_PCT = 10;
+  const SPIKE_ALERT_TESTING = false;
+  const MEMORY_DEPTH = 3;
+  const SPIKE_COOLDOWN_MS = BRACKET.SPIKE_COOLDOWN_MS;
+  const SPIKE_MIN_PCT = 20;
   const TEST_MAX_OPEN_TRADES = 25;
   const ALERT_FLASH_MS = 6000;
   const TELEGRAM_STORAGE_KEY = "marketRadar.telegram";
+  const TRADING_STORAGE_KEY = "marketRadar.trading";
   const PAPER_STORAGE_KEY = "marketRadar.paper";
   const VALIDATION_STORAGE_KEY = "marketRadar.validation";
+  const ODDS_MEMORY_STORAGE_KEY = "marketRadar.oddsMemory";
   const UI_STORAGE_KEY = "marketRadar.ui";
   const BRACKET_CONFIG_STORAGE_KEY = "marketRadar.bracketConfig";
   const MAX_VALIDATION_ROWS = 1000;
+  const ODDS_MEMORY_MAX_POINTS_PER_RUNNER = 3000;
+  const ODDS_MEMORY_MAX_MATCHES = 10;
+  const ODDS_MEMORY_SAVE_MS = 10000;
 
   function getTradeExitReason(result, options = {}) {
     if (options.manual) return "MANUAL";
@@ -90,6 +96,9 @@
   };
 
   const CHART_HISTORY_MAX = 50;
+  const DEMO_TRADE_UPDATE_MIN_MS = 10000;
+  const DEMO_TRADE_UPDATE_ODDS_EPS = 0.01;
+  const DEMO_TRADE_UPDATE_HEARTBEAT_MS = 90000;
 
   const PAPER_STARTING_BANKROLL = BRACKET.STARTING_BANKROLL;
   const PAPER_POSITION_PCT = BRACKET.POSITION_PCT;
@@ -100,6 +109,10 @@
     telegramAlertsEnabled: true,
     telegramBotToken: "",
     telegramChatId: ""
+  };
+
+  const tradingSettings = {
+    autoTradingEnabled: true
   };
 
   const paper = {
@@ -115,6 +128,7 @@
   let paperReady = true;
   let paperSessionMutated = false;
   let paperCloudSaveTimer = null;
+  const demoTradeUpdateState = new Map();
 
   function storageGet(keys) {
     return new Promise((resolve) => {
@@ -186,6 +200,10 @@
     return window.__spikexCloudConfig || window.__spikexTelegramConfig || null;
   }
 
+  function cloudOddsApi() {
+    return window.__spikexCloudOdds || null;
+  }
+
   function isValidTelegramToken(token) {
     return /^\d+:[A-Za-z0-9_-]{20,}$/.test(token);
   }
@@ -226,8 +244,35 @@
     return SPORT_BRACKETS[kind] || SPORT_BRACKETS.cricket;
   }
 
+  function demoTrader() {
+    return window.__spikexDemoTrader || null;
+  }
+
+  function isAutoTradingEnabled() {
+    return tradingSettings.autoTradingEnabled !== false;
+  }
+
+  async function saveTradingSettings() {
+    await storageSet({
+      [TRADING_STORAGE_KEY]: {
+        autoTradingEnabled: tradingSettings.autoTradingEnabled
+      }
+    });
+  }
+
+  function applyTradingSettings(saved) {
+    if (!saved) return;
+    tradingSettings.autoTradingEnabled = saved.autoTradingEnabled !== false;
+  }
+
+  async function loadTradingSettings() {
+    const data = await storageGet(TRADING_STORAGE_KEY);
+    applyTradingSettings(data[TRADING_STORAGE_KEY]);
+  }
+
   function getMinSpikePct(sportName, sportId) {
-    if (SPIKE_ALERT_TESTING) return SPIKE_TEST_MIN_PCT;
+    if (DEMO_TRADING_ENABLED) return SPIKE_MIN_PCT;
+    if (SPIKE_ALERT_TESTING) return SPIKE_MIN_PCT;
     return getSportBracket(sportName, sportId).minSpikePct;
   }
 
@@ -434,8 +479,19 @@
     return /MATCH\s*ODDS/i.test(document.body?.innerText?.slice(0, 12000) || "");
   }
 
+  const BLOCKED_RUNNER_NAMES =
+    /^(signals|trades|matches|research|paper|charts|odds|validation|telegram|live|sport|open|spike|memory)$/i;
+
+  function isBlockedRunnerName(name) {
+    return BLOCKED_RUNNER_NAMES.test(String(name || "").trim());
+  }
+
+  function sanitizeRunners(runners) {
+    return (runners || []).filter((r) => r?.runnerName && !isBlockedRunnerName(r.runnerName));
+  }
+
   function buildMatchNameFromRunners(runners) {
-    const teams = (runners || []).filter((r) => !/the draw|^draw$/i.test(r.runnerName));
+    const teams = sanitizeRunners(runners).filter((r) => !/the draw|^draw$/i.test(r.runnerName));
     if (teams.length >= 2) return `${teams[0].runnerName} v ${teams[1].runnerName}`;
     return getPageMatchHintFromDom() || teams[0]?.runnerName || "Live match";
   }
@@ -457,6 +513,11 @@
     return null;
   }
 
+  function tryEnsureOneClick(force = false) {
+    if (!isOnMatchDetailPage()) return;
+    demoTrader()?.ensureOneClickEnabled?.({ force });
+  }
+
   function ensureDetailOdds() {
     if (!isOnMatchDetailPage()) return false;
 
@@ -465,6 +526,7 @@
     if (!syncLivePageMatch(reduxFm)) return false;
 
     board.focusedMatch = mergeDomWithRedux(board.focusedMatch, reduxFm);
+    tryEnsureOneClick();
     return true;
   }
 
@@ -549,7 +611,7 @@
   function syncLivePageMatch(reduxHint = null) {
     if (!isOnMatchDetailPage()) return false;
 
-    const runners = scrapeRunnersFromDomInContentScript();
+    const runners = sanitizeRunners(scrapeRunnersFromDomInContentScript());
     if (!runners.length) return false;
 
     const matchName = buildMatchNameFromRunners(runners);
@@ -670,6 +732,7 @@
   }
 
   function getMaxOpenTrades() {
+    if (DEMO_TRADING_ENABLED) return 1;
     return SPIKE_ALERT_TESTING ? TEST_MAX_OPEN_TRADES : BRACKET.MAX_OPEN_TRADES;
   }
 
@@ -836,7 +899,9 @@
     }
     return {
       signals,
-      trades: closed + getOpenTradeCount(),
+      trades: DEMO_TRADING_ENABLED
+        ? (demoTrader()?.getStats?.()?.closedCount ?? 0) + (demoTrader()?.getStats?.()?.openCount ?? 0)
+        : closed + getOpenTradeCount(),
       matches: matchIds.size,
       closed,
       closedTarget: BRACKET.MIN_CLOSED_TRADES
@@ -853,7 +918,9 @@
       : onDetail
         ? "—"
         : "—";
-    const openTrades = state.paper?.openCount ?? getOpenTradeCount();
+    const openTrades = DEMO_TRADING_ENABLED
+      ? state.demo?.openCount ?? 0
+      : state.paper?.openCount ?? getOpenTradeCount();
     const eventId = onDetail ? String(fm.eventId) : null;
     const signalRows = eventId
       ? validationRowsForView(eventId, fm?.eventName || ctx.matchName).length
@@ -888,9 +955,11 @@
   }
 
   function formatPaperBadge(state) {
-    const n = state.paper?.openCount ?? 0;
+    const n = DEMO_TRADING_ENABLED
+      ? state.demo?.openCount ?? 0
+      : state.paper?.openCount ?? 0;
     if (n <= 0) return "";
-    return SPIKE_ALERT_TESTING && n > 1 ? `${n} OPEN` : "OPEN";
+    return n > 1 ? `${n} OPEN` : "OPEN";
   }
 
   function formatLiveBadge(state) {
@@ -909,6 +978,11 @@
 
   const priceMemory = new Map();
   const chartOddsHistory = new Map();
+  const oddsMemoryStore = { matches: {} };
+  const oddsMemoryLastTick = new Map();
+  let oddsMemoryDirty = false;
+  let oddsMemorySaveTimer = null;
+  let oddsMemoryPointsSinceSave = 0;
   const lastSpikeAt = new Map();
   let selectedRunnerKey = null;
   let tickChanges = 0;
@@ -1055,6 +1129,147 @@
     for (const key of chartOddsHistory.keys()) {
       if (key.startsWith(prefix)) chartOddsHistory.delete(key);
     }
+  }
+
+  function ensureOddsMemoryMatch(eventId, matchName, sportName) {
+    const id = String(eventId);
+    if (!oddsMemoryStore.matches[id]) {
+      oddsMemoryStore.matches[id] = {
+        eventId: id,
+        matchName: matchName || "",
+        sportName: sportName || "",
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        runners: {}
+      };
+    } else {
+      if (matchName) oddsMemoryStore.matches[id].matchName = matchName;
+      if (sportName) oddsMemoryStore.matches[id].sportName = sportName;
+    }
+    return oddsMemoryStore.matches[id];
+  }
+
+  function trimOddsMemoryRunnerSeries(series) {
+    while (series.length > ODDS_MEMORY_MAX_POINTS_PER_RUNNER) {
+      series.shift();
+    }
+  }
+
+  function trimOddsMemoryMatches() {
+    const entries = Object.values(oddsMemoryStore.matches);
+    if (entries.length <= ODDS_MEMORY_MAX_MATCHES) return;
+    entries.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    const keep = new Set(entries.slice(0, ODDS_MEMORY_MAX_MATCHES).map((m) => m.eventId));
+    for (const id of Object.keys(oddsMemoryStore.matches)) {
+      if (!keep.has(id)) {
+        delete oddsMemoryStore.matches[id];
+        for (const key of [...oddsMemoryLastTick.keys()]) {
+          if (key.startsWith(`${id}:`)) oddsMemoryLastTick.delete(key);
+        }
+      }
+    }
+  }
+
+  function recordOddsMemoryFromMatch(fm) {
+    if (!fm?.eventId || !fm?.runners?.length) return;
+
+    const eventId = String(fm.eventId);
+    const match = ensureOddsMemoryMatch(eventId, fm.eventName, fm.sportName);
+    let anyNew = false;
+
+    for (const runner of fm.runners) {
+      const back = normalizeOdds(runner.back);
+      const lay = normalizeOdds(runner.lay);
+      if (back == null && lay == null) continue;
+
+      const runnerKey = String(runner.runnerId || runner.runnerName || "");
+      if (!runnerKey) continue;
+
+      const tickKey = `${eventId}:${runnerKey}`;
+      const prev = oddsMemoryLastTick.get(tickKey);
+      if (prev && prev.back === back && prev.lay === lay) continue;
+
+      oddsMemoryLastTick.set(tickKey, { back, lay });
+
+      if (!match.runners[runnerKey]) {
+        match.runners[runnerKey] = { runnerName: runner.runnerName || runnerKey, points: [] };
+      } else if (runner.runnerName) {
+        match.runners[runnerKey].runnerName = runner.runnerName;
+      }
+
+      match.runners[runnerKey].points.push({ at: Date.now(), back, lay });
+      trimOddsMemoryRunnerSeries(match.runners[runnerKey].points);
+      anyNew = true;
+      oddsMemoryPointsSinceSave += 1;
+    }
+
+    if (anyNew) {
+      match.updatedAt = Date.now();
+      oddsMemoryDirty = true;
+      scheduleOddsMemorySave();
+    }
+
+    void cloudOddsApi()?.recordMatchOdds?.(fm);
+  }
+
+  function scheduleOddsMemorySave() {
+    if (oddsMemorySaveTimer) return;
+    oddsMemorySaveTimer = window.setTimeout(() => {
+      oddsMemorySaveTimer = null;
+      void flushOddsMemorySave();
+    }, ODDS_MEMORY_SAVE_MS);
+  }
+
+  async function flushOddsMemorySave() {
+    if (!oddsMemoryDirty && oddsMemoryPointsSinceSave < 20) return;
+    oddsMemoryDirty = false;
+    oddsMemoryPointsSinceSave = 0;
+    trimOddsMemoryMatches();
+    await storageSet({ [ODDS_MEMORY_STORAGE_KEY]: oddsMemoryStore });
+  }
+
+  function rebuildOddsMemoryLastTick() {
+    oddsMemoryLastTick.clear();
+    for (const match of Object.values(oddsMemoryStore.matches)) {
+      for (const [runnerKey, runner] of Object.entries(match.runners || {})) {
+        const pts = runner.points;
+        if (!pts?.length) continue;
+        const last = pts[pts.length - 1];
+        oddsMemoryLastTick.set(`${match.eventId}:${runnerKey}`, { back: last.back, lay: last.lay });
+      }
+    }
+  }
+
+  async function loadOddsMemory() {
+    const data = await storageGet(ODDS_MEMORY_STORAGE_KEY);
+    if (data[ODDS_MEMORY_STORAGE_KEY]?.matches) {
+      oddsMemoryStore.matches = data[ODDS_MEMORY_STORAGE_KEY].matches;
+      rebuildOddsMemoryLastTick();
+    }
+  }
+
+  function getOddsMemoryStats(eventId) {
+    const id = eventId != null ? String(eventId) : null;
+    const match = id ? oddsMemoryStore.matches[id] : null;
+    if (match) {
+      let points = 0;
+      let runners = 0;
+      for (const runner of Object.values(match.runners || {})) {
+        runners += 1;
+        points += runner.points?.length || 0;
+      }
+      return { eventId: id, matchName: match.matchName, runners, points, updatedAt: match.updatedAt };
+    }
+    const all = Object.values(oddsMemoryStore.matches);
+    return {
+      matches: all.length,
+      totalPoints: all.reduce(
+        (sum, m) =>
+          sum +
+          Object.values(m.runners || {}).reduce((runnerSum, runner) => runnerSum + (runner.points?.length || 0), 0),
+        0
+      )
+    };
   }
 
   function normalizeChartKey(value) {
@@ -2081,6 +2296,7 @@
   }
 
   function tryOpenPaperTrade(spikeEntry, eventId, runnerKey, signalRowId, done) {
+    if (!PAPER_TRADING_ENABLED) return;
     const finish = (trade, blockReason) => {
       if (trade) {
         sendPaperTelegram(formatPaperOpenMessage(trade));
@@ -2096,6 +2312,322 @@
       await clearStalePaperTradeIfNeeded();
       const { trade, blockReason } = openPaperTradeSync(spikeEntry, eventId, runnerKey, signalRowId);
       finish(trade, blockReason);
+    })();
+  }
+
+  function resolveDemoTradeLevels(tradeOrSide, entryOddsMaybe) {
+    if (tradeOrSide?.targetOdds != null && tradeOrSide?.stopOdds != null) {
+      return { targetOdds: tradeOrSide.targetOdds, stopOdds: tradeOrSide.stopOdds };
+    }
+    const side = tradeOrSide?.side || tradeOrSide;
+    const entryOdds = tradeOrSide?.entryOdds ?? entryOddsMaybe;
+    return calcTargetStop(side, entryOdds);
+  }
+
+  function appendTargetStopLines(lines, levels) {
+    lines.push(
+      "",
+      "Target:",
+      formatOdds(levels.targetOdds),
+      "",
+      "Stop:",
+      formatOdds(levels.stopOdds)
+    );
+  }
+
+  function markDemoTradeUpdateSent(tradeId, currentOdds) {
+    demoTradeUpdateState.set(tradeId, {
+      lastSentAt: Date.now(),
+      lastOdds: currentOdds
+    });
+  }
+
+  function seedDemoTradeUpdateStateFromLedger() {
+    const dt = demoTrader();
+    if (!dt) return;
+    const now = Date.now();
+    for (const open of dt.getOpenTrades()) {
+      if (demoTradeUpdateState.has(open.tradeId)) continue;
+      demoTradeUpdateState.set(open.tradeId, {
+        lastSentAt: now,
+        lastOdds: open.entryOdds ?? null
+      });
+    }
+  }
+
+  function ensureDemoTradeUpdateBaseline(tradeId, currentOdds) {
+    if (demoTradeUpdateState.has(tradeId)) return true;
+    demoTradeUpdateState.set(tradeId, {
+      lastSentAt: Date.now(),
+      lastOdds: currentOdds
+    });
+    return false;
+  }
+
+  function clearDemoTradeUpdateState(tradeId) {
+    demoTradeUpdateState.delete(tradeId);
+  }
+
+  function shouldSendDemoTradeUpdate(tradeId, currentOdds) {
+    const prev = demoTradeUpdateState.get(tradeId);
+    if (!prev) return false;
+
+    const elapsed = Date.now() - prev.lastSentAt;
+    if (elapsed < DEMO_TRADE_UPDATE_MIN_MS) return false;
+    if (prev.lastOdds == null || !Number.isFinite(prev.lastOdds)) return true;
+    if (Math.abs(currentOdds - prev.lastOdds) >= DEMO_TRADE_UPDATE_ODDS_EPS) return true;
+    return elapsed >= DEMO_TRADE_UPDATE_HEARTBEAT_MS;
+  }
+
+  function openTradeMatchesFocus(open, fm) {
+    if (!open || !fm) return false;
+    if (String(open.eventId) === String(fm.eventId)) return true;
+
+    const openMatch = normalizeChartKey(open.match || "");
+    const fmMatch = normalizeChartKey(fm.eventName || "");
+    if (!openMatch || !fmMatch) return false;
+    return openMatch === fmMatch || openMatch.includes(fmMatch) || fmMatch.includes(openMatch);
+  }
+
+  function findRunnerForOpenTrade(open, runners) {
+    if (!runners?.length) return null;
+
+    const tradeKeys = new Set(
+      [
+        String(open.runnerKey || ""),
+        String(open.runner || ""),
+        normalizeChartKey(open.runner || ""),
+        chartKeySlug(open.runner || "")
+      ].filter(Boolean)
+    );
+
+    for (const runner of runners) {
+      for (const key of runnerKeysForLookup(runner)) {
+        if (tradeKeys.has(key)) return runner;
+      }
+    }
+
+    const target = normalizeChartKey(open.runner || "");
+    if (!target) return null;
+    return (
+      runners.find((runner) => normalizeChartKey(runner.runnerName) === target) ||
+      runners.find(
+        (runner) =>
+          normalizeChartKey(runner.runnerName).includes(target) ||
+          target.includes(normalizeChartKey(runner.runnerName))
+      ) ||
+      null
+    );
+  }
+
+  function pruneDemoTradeUpdateState(openTradeIds) {
+    for (const id of demoTradeUpdateState.keys()) {
+      if (!openTradeIds.has(id)) demoTradeUpdateState.delete(id);
+    }
+  }
+
+  function demoEntryStake() {
+    return demoTrader()?.getStake?.() || 100;
+  }
+
+  function getDemoTradeCurrentOdds(open, runner) {
+    return normalizeOdds(open.side === "BACK" ? runner.back : runner.lay ?? runner.back);
+  }
+
+  function formatSideOrderLine(side, odds, stake) {
+    return `${spikeActionLabel(side)} @ ${formatOdds(odds)} · ${formatInr(stake)}`;
+  }
+
+  function appendExitPlanLines(lines) {
+    lines.push(
+      "",
+      "Exit:",
+      "Target odds → Cash Out",
+      "Stop odds → Loss Cut",
+      "(Cricway auto-hedges — no manual opposite bet)"
+    );
+  }
+
+  function formatDemoOpenUpdateTelegram(trade, runner) {
+    const currentOdds = getDemoTradeCurrentOdds(trade, runner);
+    const levels = resolveDemoTradeLevels(trade);
+
+    return [
+      "📊 Open Trade Update",
+      "",
+      "Match:",
+      trade.match || "—",
+      "",
+      "Selection:",
+      trade.runner || "—",
+      "",
+      "Trade ID:",
+      trade.tradeId,
+      "",
+      "Entry:",
+      formatSideOrderLine(trade.side, trade.entryOdds, trade.stake),
+      "",
+      "Now:",
+      `${spikeActionLabel(trade.side)} @ ${formatOdds(currentOdds)}`,
+      "",
+      "Target:",
+      formatOdds(levels.targetOdds),
+      "",
+      "Stop:",
+      formatOdds(levels.stopOdds),
+      "",
+      "Exit plan:",
+      "Target → Cash Out · Stop → Loss Cut",
+      "",
+      "Status:",
+      "OPEN — monitoring"
+    ].join("\n");
+  }
+
+  function formatDemoEntryTelegram(entry, trade, error, statusOverride) {
+    const side = trade?.side || entry.decision || bracketTradeHypothesis(entry.delta);
+    const entryOdds = normalizeOdds(
+      trade?.entryOdds ?? entry.entryPrice ?? spikeEntryPrice(side, entry.to, entry.lay)
+    );
+    const stake = trade?.stake ?? demoEntryStake();
+    const levels = resolveDemoTradeLevels(trade || { side, entryOdds }, entryOdds);
+    const sign = entry.delta > 0 ? "+" : "";
+    const lines = [
+      "⚡ Spike Detected",
+      "",
+      "Match:",
+      entry.matchName || "—",
+      "",
+      "Market:",
+      "Match Odds",
+      "",
+      "Selection:",
+      entry.runnerName || "—",
+      "",
+      "Entry:",
+      formatSideOrderLine(side, entryOdds, stake),
+      "",
+      "Spike:",
+      `${sign}${Number(entry.delta).toFixed(0)}%`,
+      "",
+      "Memory:",
+      String(MEMORY_DEPTH)
+    ];
+    appendTargetStopLines(lines, levels);
+    appendExitPlanLines(lines);
+    lines.push("", "Mode:", "Click only — your 1-click stake");
+    if (statusOverride) {
+      lines.push("", "Status:", statusOverride);
+    } else if (trade) {
+      lines.push("", "Status:", "EXECUTED", "", "Trade ID:", trade.tradeId);
+    } else {
+      lines.push("", "Status:", "FAILED", "", "Error:", error || "Unknown");
+    }
+    return lines.join("\n");
+  }
+
+  function notifyManualSpike(entry) {
+    activeAlert = entry;
+    alertFlashUntil = Date.now() + ALERT_FLASH_MS;
+    playSpikeTone();
+    panelApi?.flashHeader?.();
+    if (settings.telegramAlertsEnabled) {
+      void sendTelegramMessage(formatDemoEntryTelegram(entry, null, null, "MANUAL"));
+    }
+    panelApi?.render?.(getViewState());
+  }
+
+  function formatDemoExitTelegram(trade) {
+    const levels = resolveDemoTradeLevels(trade);
+    const exitLabel =
+      trade.exitMethod === "losscut" || trade.exitSide === "LOSS CUT" ? "Loss Cut" : "Cash Out";
+    const lines = [
+      "✅ Position Closed",
+      "",
+      "Match:",
+      trade.match || "—",
+      "",
+      "Selection:",
+      trade.runner || "—",
+      "",
+      "Trade ID:",
+      trade.tradeId,
+      "",
+      "Entry:",
+      formatSideOrderLine(trade.side, trade.entryOdds, trade.stake),
+      "",
+      "Target:",
+      formatOdds(levels.targetOdds),
+      "",
+      "Stop:",
+      formatOdds(levels.stopOdds),
+      "",
+      "Exit:",
+      exitLabel
+    ];
+    const exitAmount = trade.exitAmount ?? trade.cashoutAmount ?? trade.lossCutAmount;
+    if (exitAmount != null) {
+      lines.push("", `${exitLabel} Value:`, formatInr(exitAmount));
+    }
+    if (trade.exitVerified) {
+      lines.push("", "Verified:", trade.exitVerified);
+    }
+    lines.push(
+      "",
+      "Realized PnL:",
+      `${formatInr(trade.pnl)}${trade.pnlEstimated ? " (est.)" : ""}`,
+      "",
+      "Reason:",
+      trade.exitReason || "Exit",
+      "",
+      "Status:",
+      "CLOSED"
+    );
+    return lines.join("\n");
+  }
+
+  function tryExecuteDemoTrade(spikeEntry, eventId, runnerKey, signalRowId) {
+    const dt = demoTrader();
+    if (!DEMO_TRADING_ENABLED || !dt) return;
+
+    void (async () => {
+      const side = spikeEntry.decision || bracketTradeHypothesis(spikeEntry.delta);
+      const entryOdds = normalizeOdds(
+        spikeEntry.entryPrice ?? spikeEntryPrice(side, spikeEntry.to, spikeEntry.lay)
+      );
+
+      const levels = calcTargetStop(side, entryOdds);
+
+      const result = await dt.executeEntry({
+        runnerName: spikeEntry.runnerName,
+        side,
+        entryOdds,
+        targetOdds: levels.targetOdds,
+        stopOdds: levels.stopOdds,
+        eventId,
+        runnerKey,
+        matchName: spikeEntry.matchName,
+        marketName: "Match Odds",
+        signalRowId
+      });
+
+      if (result.ok && result.trade && signalRowId) {
+        markDemoTradeUpdateSent(result.trade.tradeId, result.trade.entryOdds);
+        linkValidationTradeOpen(eventId, signalRowId, {
+          tradeId: result.trade.tradeId,
+          side: result.trade.side,
+          entryOdds: result.trade.entryOdds,
+          targetOdds: result.trade.targetOdds,
+          stopOdds: result.trade.stopOdds,
+          runner: result.trade.runner
+        });
+      }
+
+      if (settings.telegramAlertsEnabled) {
+        void sendTelegramMessage(formatDemoEntryTelegram(spikeEntry, result.trade, result.error));
+      }
+
+      panelApi?.render?.(getViewState());
     })();
   }
 
@@ -2183,7 +2715,83 @@
     return true;
   }
 
+  function checkDemoTradeUpdates(fm) {
+    const dt = demoTrader();
+    if (!DEMO_TRADING_ENABLED || !dt || !fm?.runners?.length || !isMarketTradable(fm)) return;
+    if (!settings.telegramAlertsEnabled) return;
+
+    const openTrades = dt.getOpenTrades();
+    const openIds = new Set(openTrades.map((t) => t.tradeId));
+
+    for (const open of openTrades) {
+      if (!openTradeMatchesFocus(open, fm)) continue;
+
+      const runner = findRunnerForOpenTrade(open, fm.runners);
+      if (!runner) continue;
+
+      const currentOdds = getDemoTradeCurrentOdds(open, runner);
+      if (currentOdds == null) continue;
+      if (!ensureDemoTradeUpdateBaseline(open.tradeId, currentOdds)) continue;
+      if (!shouldSendDemoTradeUpdate(open.tradeId, currentOdds)) continue;
+
+      markDemoTradeUpdateSent(open.tradeId, currentOdds);
+      void sendTelegramMessage(formatDemoOpenUpdateTelegram(open, runner));
+    }
+
+    pruneDemoTradeUpdateState(openIds);
+  }
+
+  function checkDemoTradeExit(fm) {
+    const dt = demoTrader();
+    if (!DEMO_TRADING_ENABLED || !isAutoTradingEnabled() || !dt || !fm?.runners?.length || !isMarketTradable(fm)) {
+      return;
+    }
+
+    void dt.checkExits(
+      (open) => {
+        const runner = findRunnerForOpenTrade(open, fm.runners);
+        if (!runner || !openTradeMatchesFocus(open, fm)) return null;
+        return { back: runner.back, lay: runner.lay };
+      },
+      (open, currentOdds) => {
+        const levels =
+          open.targetOdds != null && open.stopOdds != null
+            ? { targetOdds: open.targetOdds, stopOdds: open.stopOdds }
+            : calcTargetStop(open.side, open.entryOdds);
+        if (open.side === "BACK") {
+          if (currentOdds <= levels.targetOdds) return { exit: true, reason: "Profit Target" };
+          if (currentOdds >= levels.stopOdds) return { exit: true, reason: "Stop Loss" };
+        } else {
+          if (currentOdds >= levels.targetOdds) return { exit: true, reason: "Profit Target" };
+          if (currentOdds <= levels.stopOdds) return { exit: true, reason: "Stop Loss" };
+        }
+        return { exit: false };
+      }
+    ).then((results) => {
+      for (const result of results) {
+        if (!result?.ok || !result.trade) continue;
+        clearDemoTradeUpdateState(result.trade.tradeId);
+        updateValidationTradeClose(
+          {
+            tradeId: result.trade.tradeId,
+            result: result.trade.pnl >= 0 ? "WIN" : "LOSS",
+            exitOdds: result.trade.exitOdds,
+            pnl: result.trade.pnl,
+            side: result.trade.side,
+            entryOdds: result.trade.entryOdds
+          },
+          { manual: false }
+        );
+        if (settings.telegramAlertsEnabled) {
+          void sendTelegramMessage(formatDemoExitTelegram(result.trade));
+        }
+      }
+      if (results.length) panelApi?.render?.(getViewState());
+    });
+  }
+
   function checkPaperTradeExit(fm) {
+    if (!PAPER_TRADING_ENABLED) return;
     if (!fm?.runners?.length || !isMarketTradable(fm)) return;
 
     for (const open of [...getOpenTrades()]) {
@@ -2498,14 +3106,19 @@
     await Promise.all([
       loadUiPanelState(),
       loadTelegramSettings(),
-      loadPaperState(),
+      loadTradingSettings(),
+      PAPER_TRADING_ENABLED ? loadPaperState() : Promise.resolve(),
+      demoTrader()?.loadLedger?.() || Promise.resolve(),
       loadValidationStore(),
+      loadOddsMemory(),
       loadBracketConfig()
     ]);
     if (uiPanelState.selectedRunnerKey) selectedRunnerKey = uiPanelState.selectedRunnerKey;
     paperReady = true;
-    await refreshSystemPaperFromCloud();
+    if (PAPER_TRADING_ENABLED) await refreshSystemPaperFromCloud();
+    seedDemoTradeUpdateStateFromLedger();
     refreshCricwayAccount();
+    tryEnsureOneClick(true);
     panelApi?.syncMinimized?.();
     panelApi?.render?.(getViewState());
     panelApi?.updateCricwayBalanceUi?.();
@@ -2592,7 +3205,9 @@
               recentSpikes.unshift(entry);
               while (recentSpikes.length > 12) recentSpikes.pop();
 
-              const paperSkipped = getOpenTradeCount() >= getMaxOpenTrades();
+              const tradeSkipped = DEMO_TRADING_ENABLED
+                ? Boolean(demoTrader()?.canOpenTrade?.(eventId, runnerKey))
+                : getOpenTradeCount() >= getMaxOpenTrades();
               const signalRowId = recordValidationSignal({
                 eventId,
                 matchName,
@@ -2607,16 +3222,22 @@
                 decision,
                 matchState,
                 sportName,
-                paperSkipped,
+                paperSkipped: Boolean(tradeSkipped),
                 paperBlocked: false,
                 paperBlockedOutsideOdds: false
               });
 
-              if (SPIKE_ALERT_TESTING || !paperSkipped) {
-                triggerSpikeAlert(entry);
-              }
-              if (!paperSkipped) {
-                tryOpenPaperTrade(entry, eventId, runnerKey, signalRowId);
+              if (DEMO_TRADING_ENABLED) {
+                if (!tradeSkipped) {
+                  if (isAutoTradingEnabled()) {
+                    tryExecuteDemoTrade(entry, eventId, runnerKey, signalRowId);
+                  } else {
+                    notifyManualSpike(entry);
+                  }
+                }
+              } else {
+                if (SPIKE_ALERT_TESTING || !tradeSkipped) triggerSpikeAlert(entry);
+                if (!tradeSkipped) tryOpenPaperTrade(entry, eventId, runnerKey, signalRowId);
               }
             }
           }
@@ -2721,8 +3342,13 @@
         }));
       }
 
+      recordOddsMemoryFromMatch(fm);
+
+      checkDemoTradeExit(fm);
+      checkDemoTradeUpdates(fm);
       checkPaperTradeExit(fm);
       board = { ...board, pageMode: "detail", focusedMatch: fm };
+      tryEnsureOneClick();
     }
   }
 
@@ -2734,8 +3360,10 @@
       syncValidationForMatch(ctx.eventId, ctx.matchName);
     }
 
-    const globalPaper = getPaperStats();
-    const matchPaper = onDetail ? getMatchPaperStats(ctx.eventId, ctx.matchName) : null;
+    const globalPaper = PAPER_TRADING_ENABLED ? getPaperStats() : null;
+    const matchPaper =
+      PAPER_TRADING_ENABLED && onDetail ? getMatchPaperStats(ctx.eventId, ctx.matchName) : null;
+    const demoStats = DEMO_TRADING_ENABLED ? demoTrader()?.getStats?.() || {} : null;
 
     return {
       storeConnected,
@@ -2749,17 +3377,28 @@
       alertFlashUntil,
       telegramStatus,
       settings,
-      paper: {
-        ...globalPaper,
-        global: globalPaper,
-        match: matchPaper,
-        enabled: true,
-        state: matchPaper?.state || paper.state,
-        openTrade: matchPaper?.openTrade || null,
-        otherOpenTrade: matchPaper?.otherOpenTrade || null,
-        recentTrades: onDetail ? getTradesForMatch(ctx.eventId, ctx.matchName, 6) : [],
-        auditRows: onDetail ? getPaperAuditRowsForMatch(ctx.eventId, ctx.matchName, 20) : []
-      },
+      paper: PAPER_TRADING_ENABLED
+        ? {
+            ...globalPaper,
+            global: globalPaper,
+            match: matchPaper,
+            enabled: true,
+            state: matchPaper?.state || paper.state,
+            openTrade: matchPaper?.openTrade || null,
+            otherOpenTrade: matchPaper?.otherOpenTrade || null,
+            recentTrades: onDetail ? getTradesForMatch(ctx.eventId, ctx.matchName, 6) : [],
+            auditRows: onDetail ? getPaperAuditRowsForMatch(ctx.eventId, ctx.matchName, 20) : []
+          }
+        : null,
+      demo: DEMO_TRADING_ENABLED
+        ? {
+            ...demoStats,
+            openTrades: demoTrader()?.getOpenTrades?.() || [],
+            closedTrades: demoTrader()?.getClosedTrades?.(6) || [],
+            autoTrading: isAutoTradingEnabled()
+          }
+        : null,
+      trading: { ...tradingSettings },
       validation: {
         eventId: onDetail ? ctx.eventId : null,
         matchName:
@@ -3103,6 +3742,12 @@
     const activeOdds = getOddsLimits(fm?.sportName, fm?.sportId);
     const b = state.bracket || getBracketMetrics();
     const tg = formatTelegramStatusShort(state);
+    const om = fm?.eventId
+      ? getOddsMemoryStats(fm.eventId)
+      : getOddsMemoryStats();
+    const oddsMemoryLabel = fm?.eventId
+      ? `${om.points} ticks · ${om.runners} runners (saved locally)`
+      : `${om.matches} matches · ${om.totalPoints} ticks saved`;
 
     return `
       <div class="mr-research">
@@ -3114,12 +3759,13 @@
             <tr><th>Closed</th><td>${rp.closed}/${rp.closedTarget}</td></tr>
             <tr><th>In bracket</th><td>${watch.inBracket}/${watch.total} runners</td></tr>
             <tr><th>Spike memory</th><td>${watch.memoryReady}/${watch.inBracket || watch.total} ready (3 ticks)</td></tr>
+            <tr><th>Odds memory</th><td>${oddsMemoryLabel}</td></tr>
             <tr><th>Spikes seen</th><td>${state.totalSpikes ?? 0}</td></tr>
             <tr><th>Telegram</th><td>${escapeHtml(tg)}</td></tr>
           </tbody>
         </table>
         <div class="mr-bracket-grid mr-bracket-compact">
-          <span>${SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_TEST_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
+          <span>${DEMO_TRADING_ENABLED ? `${isAutoTradingEnabled() ? '<span class="mr-ok">AUTO</span>' : '<span class="mr-warn">MANUAL</span>'} · click only · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
           <span class="${b.totalPnl >= 0 ? "mr-ok" : "mr-warn"}">${formatInr(b.totalPnl)} · ${b.winRate.toFixed(0)}% WR</span>
         </div>
         <details class="mr-bracket-advanced">
@@ -3150,59 +3796,65 @@
     return renderPanel("bracket", "Research", "", renderResearchBody(state));
   }
 
-  function renderPaperBody(state) {
-    const p = state.paper;
-    const mp = p?.match;
-    if (!p) return "";
+  function renderTradesBody(state) {
+    const d = state.demo || {};
+    const cw = state.cricwayAccount || {};
+    const cwLabel = cw.username ? `Cricway (${escapeHtml(cw.username)})` : "Cricway";
+    const openTrades = d.openTrades || [];
+    const lastClosed = d.closedTrades?.[0] || null;
 
-    const matchPnl = mp?.matchPnl ?? 0;
-    const lastClosed = mp?.trades?.[0] || null;
     let openCell = "—";
-    const openTrades = mp?.openTrades?.length
-      ? mp.openTrades
-      : p.openTrade
-        ? [p.openTrade]
-        : [];
     if (openTrades.length) {
       openCell = openTrades
         .map(
           (t) =>
-            `${escapeHtml(t.side)} ${escapeHtml(t.runner)} @ ${formatOdds(t.entryOdds)}`
+            `${escapeHtml(t.side)} ${escapeHtml(t.runner)} @ ${formatOdds(t.entryOdds)} · T ${formatOdds(t.targetOdds)} · S ${formatOdds(t.stopOdds)}`
         )
         .join("<br>");
-    } else if (p.otherOpenTrade) {
-      openCell = `${escapeHtml(p.otherOpenTrade.side)} · other match`;
     }
 
     let lastCell = "—";
     if (lastClosed) {
-      const cls = lastClosed.result === "WIN" ? "mr-ok" : "mr-warn";
+      const cls = (lastClosed.pnl ?? 0) >= 0 ? "mr-ok" : "mr-warn";
       lastCell = `<span class="${cls}">${escapeHtml(lastClosed.side)} ${formatOdds(lastClosed.entryOdds)}→${formatOdds(lastClosed.exitOdds)} ${formatInr(lastClosed.pnl)}</span>`;
     }
 
-    const cw = state.cricwayAccount || {};
-    const cwLabel = cw.username ? `Cricway (${escapeHtml(cw.username)})` : "Cricway";
+    const statusCell = d.lastError
+      ? `<span class="mr-warn">${escapeHtml(d.lastError)}</span>`
+      : escapeHtml(d.lastAction || "Ready");
 
     return `
       <table class="mr-kv-table">
         <tbody>
           <tr><th>${cwLabel}</th><td class="mr-cw-balance">${formatCricwayBalance(cw.balance)}</td></tr>
-          <tr><th>Paper bank</th><td>${formatInr(p.bankroll)}</td></tr>
-          <tr><th>Match PnL</th><td class="${matchPnl >= 0 ? "mr-ok" : "mr-warn"}">${formatInr(matchPnl)}</td></tr>
+          <tr><th>Mode</th><td class="${d.autoTrading ? "mr-ok" : "mr-warn"}">${d.autoTrading ? "AUTO · click only" : "MANUAL"}</td></tr>
           <tr><th>Open</th><td>${openCell}</td></tr>
+          <tr><th>Total PnL</th><td class="${(d.totalPnl ?? 0) >= 0 ? "mr-ok" : "mr-warn"}">${formatInr(d.totalPnl ?? 0)}</td></tr>
           <tr><th>Last Closed</th><td>${lastCell}</td></tr>
+          <tr><th>Status</th><td>${statusCell}</td></tr>
         </tbody>
       </table>
     `;
   }
 
+  function renderPaperBody(state) {
+    if (DEMO_TRADING_ENABLED) return renderTradesBody(state);
+    return "";
+  }
+
   function renderPaperDashboard(state) {
+    const panelTitle = DEMO_TRADING_ENABLED ? "Trades" : "Paper";
+
+    if (DEMO_TRADING_ENABLED) {
+      return renderPanel("paper", panelTitle, formatPaperBadge(state), renderTradesBody(state));
+    }
+
     if (state.board.pageMode !== "detail") {
       const p = state.paper;
       if (!p) return "";
       return renderPanel(
         "paper",
-        "Paper",
+        panelTitle,
         "",
         `<table class="mr-kv-table"><tbody>
           <tr><th>Cricway</th><td class="mr-cw-balance">${formatCricwayBalance(state.cricwayAccount?.balance)}</td></tr>
@@ -3212,24 +3864,10 @@
     }
     const ctx = getCurrentMatchContext();
     if (!state.board?.focusedMatch?.runners?.length && !ctx.eventId) {
-      return renderMatchWaitPanel("paper", "Paper", formatPaperBadge(state));
+      return renderMatchWaitPanel("paper", panelTitle, formatPaperBadge(state));
     }
-    if (!state.board?.focusedMatch?.runners?.length && ctx.eventId) {
-      const p = state.paper;
-      const mp = getMatchPaperStats(ctx.eventId, ctx.matchName);
-      return renderPanel(
-        "paper",
-        "Paper",
-        formatPaperBadge(state),
-        `<table class="mr-kv-table"><tbody>
-          <tr><th>Cricway</th><td class="mr-cw-balance">${formatCricwayBalance(state.cricwayAccount?.balance)}</td></tr>
-          <tr><th>Paper bank</th><td>${formatInr(p.bankroll)}</td></tr>
-          <tr><th>Match PnL</th><td>${formatInr(mp?.matchPnl ?? 0)}</td></tr>
-        </tbody></table>`
-      );
-    }
-    if (!state.board?.focusedMatch) return renderMatchWaitPanel("paper", "Paper", formatPaperBadge(state));
-    return renderPanel("paper", "Paper", formatPaperBadge(state), renderPaperBody(state));
+    if (!state.board?.focusedMatch) return renderMatchWaitPanel("paper", panelTitle, formatPaperBadge(state));
+    return renderPanel("paper", panelTitle, formatPaperBadge(state), renderPaperBody(state));
   }
   function buildLiveOddsRows(state) {
     const focused = state.board.focusedMatch;
@@ -3305,6 +3943,7 @@
           <div class="mr-stat"><span class="mr-stat-k">OPEN</span><span class="mr-stat-v mr-stat-open">0/1</span></div>
           <div class="mr-stat"><span class="mr-stat-k">CW</span><span class="mr-stat-v mr-stat-cw">—</span></div>
           <div class="mr-stat"><span class="mr-stat-k">TG</span><span class="mr-stat-v mr-stat-tg">OFF</span></div>
+          <button type="button" class="mr-trading-toggle" title="Toggle auto/manual trading">AUTO</button>
           <button type="button" class="mr-alerts-toggle" title="Toggle Telegram alerts">ALERTS ON</button>
           <button type="button" class="mr-export-json" disabled title="Export signal log JSON">JSON</button>
         </div>
@@ -3369,6 +4008,7 @@
     const statOpen = root.querySelector(".mr-stat-open");
     const statCw = root.querySelector(".mr-stat-cw");
     const statTg = root.querySelector(".mr-stat-tg");
+    const tradingToggleBtn = root.querySelector(".mr-trading-toggle");
     const alertsToggleBtn = root.querySelector(".mr-alerts-toggle");
     const exportJsonBtn = root.querySelector(".mr-export-json");
     const mainScroll = root.querySelector(".mr-main-scroll");
@@ -3458,6 +4098,24 @@
       }, 400);
     }
 
+    function syncTradingToggleButton() {
+      if (!tradingToggleBtn) return;
+      const auto = isAutoTradingEnabled();
+      tradingToggleBtn.textContent = auto ? "AUTO" : "MANUAL";
+      tradingToggleBtn.classList.toggle("mr-trading-auto", auto);
+      tradingToggleBtn.classList.toggle("mr-trading-manual", !auto);
+      tradingToggleBtn.title = auto
+        ? "Auto trading on — click for manual (alerts only)"
+        : "Manual mode — click for auto trading";
+    }
+
+    function setAutoTradingEnabled(enabled) {
+      tradingSettings.autoTradingEnabled = Boolean(enabled);
+      syncTradingToggleButton();
+      void saveTradingSettings();
+      panelApi?.render?.(getViewState());
+    }
+
     function syncAlertsToggleButton() {
       if (!alertsToggleBtn) return;
       const on = settings.telegramAlertsEnabled;
@@ -3503,6 +4161,10 @@
         settingsEl.open = isPanelOpen("telegram");
       }
     }
+
+    tradingToggleBtn?.addEventListener("click", () => {
+      setAutoTradingEnabled(!isAutoTradingEnabled());
+    });
 
     alertsToggleBtn?.addEventListener("click", () => {
       setTelegramAlertsEnabled(!settings.telegramAlertsEnabled);
@@ -3682,6 +4344,7 @@
       }
 
       updateTelegramStatusUi();
+      syncTradingToggleButton();
       bracketWrap.innerHTML = renderBracketSection(state);
       paperWrap.innerHTML = renderPaperDashboard(state);
       chartWrap.innerHTML = renderSpikeChartSection(state);
@@ -3727,6 +4390,27 @@
   function nudge() {
     document.dispatchEvent(new CustomEvent("market-radar-nudge"));
   }
+
+  window.__spikexOddsMemory = {
+    stats: getOddsMemoryStats,
+    exportMatch: (eventId) => {
+      const match = oddsMemoryStore.matches[String(eventId || "")];
+      return match ? JSON.parse(JSON.stringify(match)) : null;
+    },
+    exportAll: () => JSON.parse(JSON.stringify(oddsMemoryStore)),
+    flush: () => flushOddsMemorySave(),
+    clearMatch: async (eventId) => {
+      const id = String(eventId || "");
+      if (!id) return false;
+      delete oddsMemoryStore.matches[id];
+      for (const key of [...oddsMemoryLastTick.keys()]) {
+        if (key.startsWith(`${id}:`)) oddsMemoryLastTick.delete(key);
+      }
+      oddsMemoryDirty = true;
+      await flushOddsMemorySave();
+      return true;
+    }
+  };
 
   window.__marketRadarPaperAudit = () => {
     const rows = getPaperAuditRows(20);

@@ -254,6 +254,36 @@ body.mr-console-resizing {
   filter: brightness(1.15);
 }
 
+.mr-trading-toggle {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  font: inherit;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid #333;
+  background: #111;
+  color: #888;
+}
+
+.mr-trading-toggle.mr-trading-auto {
+  color: #4ade80;
+  border-color: #166534;
+  background: #052e16;
+}
+
+.mr-trading-toggle.mr-trading-manual {
+  color: #ff9f0a;
+  border-color: #78350f;
+  background: #1a1208;
+}
+
+.mr-trading-toggle:hover {
+  filter: brightness(1.15);
+}
+
 .mr-export-json {
   flex-shrink: 0;
   padding: 1px 6px;
