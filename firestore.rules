@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global match research — odds, signals, match docs (shared)
+    match /matches/{matchId} {
+      allow read, write: if true;
+      match /{sub=**} {
+        allow read, write: if true;
+      }
+    }
+
+    // Legacy session blob
+    match /spikex/session {
+      allow read, write: if true;
+    }
+
+    // Shared Telegram config (bot token + chat IDs — all clients)
+    match /spikex/config {
+      allow read, write: if true;
+    }
+
+    // Shared system paper trading (single test account)
+    match /spikex/paper {
+      allow read, write: if true;
+    }
+
+    // Per-user paper trades + settings
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      match /{sub=**} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+  }
+}

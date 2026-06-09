@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Market Radar",
+  "version": "3.25.1",
+  "description": "SpikeX — live odds spikes + Telegram alerts + paper trades",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://api.telegram.org/*",
+    "https://firestore.googleapis.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.cricway.io/*",
+        "*://*.cricway.com/*",
+        "*://cricway.io/*",
+        "*://cricway.com/*"
+      ],
+      "js": ["src/bridge-inject.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.cricway.io/*",
+        "*://*.cricway.com/*",
+        "*://cricway.io/*",
+        "*://cricway.com/*"
+      ],
+      "js": ["src/odds-detect.js", "src/firebase-telegram-config.js", "src/market-radar.js"],
+      "css": ["styles/panel.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/odds-detect.js", "src/live-board.js"],
+      "matches": [
+        "*://*.cricway.io/*",
+        "*://*.cricway.com/*",
+        "*://cricway.io/*",
+        "*://cricway.com/*"
+      ]
+    }
+  ]
+}
