@@ -52,7 +52,15 @@
   const PAPER_TRADING_ENABLED = false;
   const DEMO_TRADING_ENABLED = true;
 
+  /** Phase 2: spike → trade only when Gemini classifies EMOTIONAL_OVERREACTION. */
+  const GEMINI_GATE_TRADES = true;
+  const GEMINI_APPROVE_CLASSIFICATION = "EMOTIONAL_OVERREACTION";
+  /** Reject approvals below this confidence (insufficient-info replies use ≤0.3). */
+  const GEMINI_MIN_APPROVE_CONFIDENCE = 0.5;
+
   const SPIKE_ALERT_TESTING = false;
+  /** Testing: disable 2.5–8 cricket odds bracket so spikes fire at any price. */
+  const ODDS_BRACKET_FILTER_ENABLED = false;
   const MEMORY_DEPTH = 3;
   const SPIKE_COOLDOWN_MS = BRACKET.SPIKE_COOLDOWN_MS;
   const SPIKE_MIN_PCT = 20;
@@ -76,7 +84,7 @@
   }
 
   const bracketConfigDefaults = {
-    oddsFilterEnabled: !SPIKE_ALERT_TESTING,
+    oddsFilterEnabled: ODDS_BRACKET_FILTER_ENABLED,
     overrideSportOdds: false,
     minOdds: BRACKET.MIN_ODDS,
     maxOdds: 20
@@ -91,6 +99,7 @@
     live: true,
     validation: true,
     telegram: false,
+    expert: false,
     minimized: false,
     consoleHeight: 400
   };
@@ -154,6 +163,44 @@
     return Boolean(settings.telegramBotToken.trim() && parseTelegramChatIds(settings.telegramChatId).length);
   }
 
+  async function ensureTelegramConfigured() {
+    if (hasTelegramConfigured()) return true;
+    try {
+      await loadTelegramSettings();
+    } catch (error) {
+      console.warn("[SpikeX Telegram] config reload failed:", error?.message || error);
+    }
+    return hasTelegramConfigured();
+  }
+
+  async function sendTelegramAlert(text, context = "alert") {
+    if (!settings.telegramAlertsEnabled) {
+      console.log("[SpikeX Telegram] skipped (alerts off):", context);
+      return { ok: false, skipped: true, reason: "alerts off" };
+    }
+
+    await ensureTelegramConfigured();
+    if (!hasTelegramConfigured()) {
+      telegramStatus = "Need bot token & chat ID";
+      panelApi?.updateTelegramStatusUi?.();
+      console.warn("[SpikeX Telegram] not configured:", context);
+      return { ok: false, reason: "not configured" };
+    }
+
+    console.log("[SpikeX Telegram] sending:", context);
+    let ok = await sendTelegramMessage(text);
+    if (!ok) {
+      await ensureTelegramConfigured();
+      ok = await sendTelegramMessage(text);
+    }
+    if (!ok) {
+      console.warn("[SpikeX Telegram] send failed:", context, telegramStatus);
+    } else {
+      console.log("[SpikeX Telegram] sent:", context);
+    }
+    return { ok, status: telegramStatus };
+  }
+
   function normalizeTelegramToken(token) {
     return String(token || "").trim();
   }
@@ -204,8 +251,24 @@
     return window.__spikexCloudOdds || null;
   }
 
+  function geminiReviewApi() {
+    return window.__spikexGeminiReview || null;
+  }
+
   function isValidTelegramToken(token) {
-    return /^\d+:[A-Za-z0-9_-]{20,}$/.test(token);
+    return /^\d+:[A-Za-z0-9_-]{20,}$/.test(String(token || "").trim());
+  }
+
+  function pickTelegramToken(...sources) {
+    const normalized = sources.map((s) => normalizeTelegramToken(s)).filter(Boolean);
+    for (const token of normalized) {
+      if (isValidTelegramToken(token)) return token;
+    }
+    return normalized[0] || "";
+  }
+
+  function telegramTokenFormatHint() {
+    return "Use BotFather token — e.g. 123456789:ABCdefGHIjklMNOpqrsTUVwxyz";
   }
 
   function formatTelegramApiError(data, status) {
@@ -220,6 +283,7 @@
 
   function telegramStatusLabel() {
     if (!settings.telegramBotToken.trim()) return "Enter bot token";
+    if (!isValidTelegramToken(settings.telegramBotToken)) return "Invalid token format";
     if (!parseTelegramChatIds(settings.telegramChatId).length) return "Enter chat ID(s)";
     if (!settings.telegramAlertsEnabled) return "Alerts off";
     return telegramStatus || "Ready";
@@ -366,7 +430,33 @@
 
   function isSyntheticEventId(eventId) {
     const id = String(eventId || "");
-    return !id || id.startsWith("dom-") || !/^\d+$/.test(id);
+    return !id || id.startsWith("dom-") || id.startsWith("live-") || !/^\d+$/.test(id);
+  }
+
+  function canonicalMatchKey(fmOrRunners, eventIdFallback = "") {
+    const runners = Array.isArray(fmOrRunners) ? fmOrRunners : fmOrRunners?.runners;
+    if (runners?.length) {
+      const names = sanitizeRunners(runners)
+        .map((r) => normalizeChartKey(r.runnerName))
+        .filter((n) => n && !/^draw$/i.test(n))
+        .sort();
+      if (names.length >= 2) return names.join("|");
+    }
+    return String(eventIdFallback || fmOrRunners?.eventId || "");
+  }
+
+  function stableSyntheticEventId(runners, matchName) {
+    const names = sanitizeRunners(runners)
+      .map((r) => normalizeChartKey(r.runnerName))
+      .filter((n) => n && !/^draw$/i.test(n))
+      .sort();
+    if (names.length >= 2) {
+      return `live-${names[0]}-v-${names[1]}`.slice(0, 48);
+    }
+    return `live-${String(matchName || "match")
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .slice(0, 36)}`;
   }
 
   function getPageMatchHintFromDom() {
@@ -513,6 +603,110 @@
     return null;
   }
 
+  function detectSportFromPage() {
+    const fromPath = sportFromPagePath();
+    if (fromPath) return fromPath;
+
+    const text = `${document.title || ""} ${document.body?.innerText || ""}`.slice(0, 12000).toLowerCase();
+    if (/fifa|football|soccer|world cup|premier league|uefa|champions league|la liga|serie a/.test(text)) {
+      return { sportId: "1", sportName: "Football" };
+    }
+    if (/cricket|ipl|t20|vitality blast|ashes|bbl/.test(text)) {
+      return { sportId: "4", sportName: "Cricket" };
+    }
+    if (/tennis|wimbledon|atp|wta|us open|roland garros/.test(text)) {
+      return { sportId: "2", sportName: "Tennis" };
+    }
+    return { sportId: "4", sportName: "Cricket" };
+  }
+
+  function scrapeCompetitionFromPage() {
+    const body = (document.body?.innerText || "").slice(0, 15000);
+    const patterns = [
+      /FIFA\s+World\s+Cup(?:\s+\d{4})?/i,
+      /Vitality\s+Blast/i,
+      /Indian\s+Premier\s+League/i,
+      /\bIPL\b/,
+      /Premier\s+League/i,
+      /UEFA[^\n]{0,50}/i,
+      /Champions\s+League/i
+    ];
+    for (const re of patterns) {
+      const match = body.match(re);
+      if (match) return match[0].trim().slice(0, 80);
+    }
+    return "";
+  }
+
+  /** Live score / status lines from the Cricway page for Gemini matchContext. */
+  function scrapeLiveMatchContextFromPage() {
+    if (!isOnMatchDetailPage()) return "";
+
+    const chunks = [];
+    const selectors = [
+      '[class*="scorecard" i]',
+      '[class*="Scorecard" i]',
+      '[class*="score-board" i]',
+      '[class*="scoreBoard" i]',
+      '[class*="live-score" i]',
+      '[class*="LiveScore" i]',
+      '[class*="match-info" i]',
+      '[class*="MatchInfo" i]',
+      '[class*="innings" i]',
+      '[class*="Innings" i]'
+    ];
+
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (el.closest("#market-radar-panel")) continue;
+        const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        if (text.length >= 8 && text.length <= 500) chunks.push(text);
+      }
+    }
+
+    const body = (document.body?.innerText || "").slice(0, 30000);
+    const lines = body
+      .split(/\n+/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+
+    const interesting =
+      /(?:\d+\s*\/\s*\d+)|(?:\b(?:CRR|RRR|RR)\b)|(?:run\s*rate)|(?:need[s]?\s+\d+)|(?:require[sd]?\s+\d+)|(?:target\s*:?\s*\d+)|(?:\d+(?:\.\d+)?\s*(?:ov|overs?))|(?:partnership)|(?:wicket)|(?:balls?\s+(?:left|remaining))|(?:yet\s+to\s+bat)|(?:innings)|(?:\b(?:HT|FT|ET)\b)|(?:\d+\s*-\s*\d+)|(?:over\s+\d+)/i;
+    const skip =
+      /^(back|lay|matched|cash\s*out|loss\s*cut|deposit|withdraw|my bets|signals|trades|research|telegram|spike|gemini|odds|charts|validation|expert|alerts|manual|auto|1-click)/i;
+
+    for (const line of lines) {
+      if (line.length < 6 || line.length > 200) continue;
+      if (skip.test(line)) continue;
+      if (interesting.test(line)) chunks.push(line);
+    }
+
+    const seen = new Set();
+    const out = [];
+    for (const chunk of chunks) {
+      const key = chunk.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(chunk);
+      if (out.join(" | ").length >= 900) break;
+    }
+
+    return out.join(" | ").slice(0, 1000);
+  }
+
+  function forceTrackCurrentMatch() {
+    ensureDetailOdds();
+    const fm = board.focusedMatch;
+    if (fm?.runners?.length) {
+      trackBoardUpdate({
+        pageMode: "detail",
+        focusedMatch: fm,
+        at: Date.now()
+      });
+    }
+    return fm;
+  }
+
   function tryEnsureOneClick(force = false) {
     if (!isOnMatchDetailPage()) return;
     demoTrader()?.ensureOneClickEnabled?.({ force });
@@ -567,6 +761,7 @@
       eventName: domFm.eventName || reduxFm?.eventName || "Live match",
       sportId: reduxFm?.sportId || domFm.sportId,
       sportName: reduxFm?.sportName || domFm.sportName,
+      competitionName: reduxFm?.competitionName || domFm.competitionName || scrapeCompetitionFromPage() || "",
       marketSuspended: Boolean(reduxFm?.marketSuspended),
       eventSuspended: Boolean(reduxFm?.eventSuspended),
       runners: domFm.runners
@@ -616,13 +811,13 @@
 
     const matchName = buildMatchNameFromRunners(runners);
     const prev = board.focusedMatch;
-    const pathSport = sportFromPagePath();
+    const pageSport = detectSportFromPage();
     const eventId =
       reduxHint?.eventId && !isSyntheticEventId(reduxHint.eventId)
         ? String(reduxHint.eventId)
         : prev?.eventId && !isSyntheticEventId(prev.eventId)
           ? String(prev.eventId)
-          : tabMatchContext.eventId || prev?.eventId || `live-${matchName.toLowerCase().replace(/\s+/g, "-").slice(0, 36)}`;
+          : tabMatchContext.eventId || prev?.eventId || stableSyntheticEventId(runners, matchName);
 
     board = {
       ...board,
@@ -634,16 +829,18 @@
         isLive: true,
         sportId:
           reduxHint?.sportId ||
-          pathSport?.sportId ||
+          pageSport?.sportId ||
           prev?.sportId ||
           board.trackSportId ||
-          (runners.length >= 3 ? "1" : "4"),
+          "4",
         sportName:
           reduxHint?.sportName ||
-          pathSport?.sportName ||
+          pageSport?.sportName ||
           prev?.sportName ||
           board.trackSportName ||
-          (runners.length >= 3 ? "Football" : "Cricket"),
+          "Cricket",
+        competitionName:
+          reduxHint?.competitionName || prev?.competitionName || scrapeCompetitionFromPage() || "",
         source: "live-page",
         marketSuspended: false,
         eventSuspended: false,
@@ -661,7 +858,7 @@
 
     updateTabMatchContext(fm);
     syncValidationForMatch(fm.eventId, fm.eventName);
-    resetWatchState(fm.eventId);
+    resetWatchState(fm.eventId, fm);
 
     return { eventId: fm.eventId, matchName: fm.eventName };
   }
@@ -849,9 +1046,9 @@
     if (!state.settings?.telegramAlertsEnabled) return "OFF";
     if (!state.settings?.telegramChatId?.trim()) return "NO CHAT";
     const s = state.telegramStatus || "—";
-    if (s === "—" || s === "Ready") return "ON";
+    if (/fail|error|invalid|wrong|blocked|need bot|need chat/i.test(s)) return "ERR";
     if (/sent|ok/i.test(s)) return "OK";
-    if (/fail|error/i.test(s)) return "ERR";
+    if (s === "—" || s === "Ready") return "ON";
     return "ON";
   }
 
@@ -918,6 +1115,8 @@
       : onDetail
         ? "—"
         : "—";
+    const sportWithComp =
+      fm?.competitionName && sport !== "—" ? `${sport} · ${fm.competitionName}` : fm?.competitionName || sport;
     const openTrades = DEMO_TRADING_ENABLED
       ? state.demo?.openCount ?? 0
       : state.paper?.openCount ?? getOpenTradeCount();
@@ -937,7 +1136,7 @@
     const cw = state.cricwayAccount || {};
     return {
       match: matchLabel,
-      sport,
+      sport: sportWithComp,
       openTrades: `${openTrades}/${getMaxOpenTrades()}`,
       cricwayBalance: formatCricwayBalance(cw.balance),
       cricwayBalanceState: cw.balance != null ? "ok" : "off",
@@ -990,6 +1189,7 @@
   let recentSpikes = [];
   let lastBoardAt = 0;
   let watchedEventId = null;
+  let watchedMatchKey = null;
   let lastMarketSuspended = false;
   let activeAlert = null;
   let alertFlashUntil = 0;
@@ -2532,7 +2732,7 @@
     playSpikeTone();
     panelApi?.flashHeader?.();
     if (settings.telegramAlertsEnabled) {
-      void sendTelegramMessage(formatDemoEntryTelegram(entry, null, null, "MANUAL"));
+      void sendTelegramAlert(formatDemoEntryTelegram(entry, null, null, "MANUAL"), "manual-spike");
     }
     panelApi?.render?.(getViewState());
   }
@@ -2658,6 +2858,7 @@
     savePaperState();
     logPaperTradeAudit(closed);
     updateValidationTradeClose(closed, options);
+    saveGeminiTradeResult(closed);
     if (options.manual && !options.stale) {
       sendPaperTelegram(formatPaperManualCloseMessage(closed));
     } else if (!options.manual) {
@@ -2782,6 +2983,7 @@
           },
           { manual: false }
         );
+        saveGeminiTradeResult(result.trade);
         if (settings.telegramAlertsEnabled) {
           void sendTelegramMessage(formatDemoExitTelegram(result.trade));
         }
@@ -2865,9 +3067,282 @@
       matchName: resolveLiveMatchName(base.matchName),
       runnerName: base.runnerName || "—",
       sportName: base.sportName || fm?.sportName || null,
+      tournament: base.tournament || fm?.competitionName || null,
       eventId: base.eventId || fm?.eventId || getCurrentMatchContext().eventId || null,
       pageUrl: location.href
     };
+  }
+
+  function buildGeminiReviewPayload(entry, ctx, signalRowId) {
+    const scrapedContext = scrapeLiveMatchContextFromPage();
+    return {
+      reviewId: signalRowId,
+      eventId: String(ctx.eventId),
+      sport: entry.sportName || board.focusedMatch?.sportName || "Unknown",
+      tournament: entry.tournament || board.focusedMatch?.competitionName || "—",
+      match: entry.matchName || ctx.matchName,
+      market: "Match Odds",
+      runner: entry.runnerName || ctx.runnerName,
+      oldOdds: ctx.baseline,
+      newOdds: entry.to ?? ctx.currentBack,
+      spikePct: ctx.spikeDelta,
+      timestamp: new Date(entry.at || Date.now()).toISOString(),
+      matchContext: scrapedContext || undefined
+    };
+  }
+
+  async function requestGeminiTradeApproval(entry, ctx, signalRowId) {
+    if (!signalRowId || !ctx?.eventId) {
+      return { approved: false, error: "missing signal or event id" };
+    }
+    const api = geminiReviewApi();
+    if (!api?.reviewSpike) {
+      return { approved: false, error: "Gemini module not loaded" };
+    }
+
+    const result = await api.reviewSpike(buildGeminiReviewPayload(entry, ctx, signalRowId));
+    const review = result?.review;
+    if (!review?.classification) {
+      return {
+        approved: false,
+        error: result?.error || "Gemini review failed",
+        classification: null
+      };
+    }
+
+    const classification = review.classification;
+    const confidence =
+      review.confidence != null && Number.isFinite(Number(review.confidence))
+        ? Number(review.confidence)
+        : null;
+    const classOk = classification === GEMINI_APPROVE_CLASSIFICATION;
+    const confOk = confidence != null && confidence >= GEMINI_MIN_APPROVE_CONFIDENCE;
+    const approved = classOk && confOk;
+
+    let rejectReason = null;
+    if (classOk && !confOk) {
+      rejectReason =
+        confidence == null
+          ? `missing confidence (need ≥${Math.round(GEMINI_MIN_APPROVE_CONFIDENCE * 100)}%)`
+          : `low confidence ${Math.round(confidence * 100)}% (need ≥${Math.round(GEMINI_MIN_APPROVE_CONFIDENCE * 100)}%)`;
+    }
+
+    return {
+      approved,
+      classification,
+      confidence,
+      shortReason: review.shortReason || "",
+      model: review.model || null,
+      rejectReason,
+      error: result?.error || null
+    };
+  }
+
+  function patchValidationGeminiGate(eventId, signalRowId, gate) {
+    const row = findValidationRow(eventId, signalRowId);
+    if (!row) return;
+
+    if (gate.pending) {
+      row.notes = "Awaiting Gemini review…";
+      void saveValidationStore();
+      return;
+    }
+
+    if (gate.classification) {
+      row.geminiClassification = gate.classification;
+      row.geminiConfidence = gate.confidence ?? null;
+    }
+
+    const conf =
+      gate.confidence != null && Number.isFinite(gate.confidence)
+        ? ` (${Math.round(gate.confidence * 100)}%)`
+        : "";
+
+    if (gate.approved) {
+      row.notes = `Gemini approved: ${gate.classification}${conf}`;
+    } else if (gate.error && !gate.classification) {
+      row.notes = `Trade blocked — Gemini error: ${String(gate.error).slice(0, 100)}`;
+    } else if (gate.rejectReason) {
+      const reason = gate.shortReason ? ` — ${gate.shortReason.slice(0, 80)}` : "";
+      row.notes = `Trade blocked — ${gate.classification || "Gemini"}${conf} — ${gate.rejectReason}${reason}`;
+    } else if (gate.classification === "JUSTIFIED_REPRICING") {
+      const reason = gate.shortReason ? ` — ${gate.shortReason.slice(0, 80)}` : "";
+      row.notes = `Trade blocked — ${gate.classification}${conf}${reason}`;
+    } else {
+      row.notes = `Trade blocked — Gemini: ${gate.classification || "no approval"}${conf}`;
+    }
+
+    void saveValidationStore();
+  }
+
+  function formatGeminiGateMessage(entry, gate, approved) {
+    const decision = entry.decision || bracketTradeHypothesis(entry.delta);
+    const sign = entry.delta > 0 ? "+" : "";
+    const lines = [
+      approved ? "✅ GEMINI APPROVED — TRADE" : "🛑 GEMINI BLOCKED — NO TRADE",
+      "",
+      "Match:",
+      entry.matchName || "—",
+      "",
+      "Runner:",
+      entry.runnerName || "—",
+      "",
+      "Odds:",
+      `${formatOdds(entry.from)} → ${formatOdds(entry.to)}`,
+      "",
+      `Spike: ${sign}${Number(entry.delta).toFixed(1)}%`,
+      `Would trade: ${spikeActionLabel(decision)} @ ${formatOdds(entry.entryPrice ?? spikeEntryPrice(decision, entry.to, entry.lay))}`,
+      ""
+    ];
+    if (gate.classification) {
+      lines.push(`Classification: ${gate.classification}`);
+      if (gate.confidence != null) lines.push(`Confidence: ${Math.round(gate.confidence * 100)}%`);
+      if (!approved && gate.rejectReason) lines.push(`Blocked: ${gate.rejectReason}`);
+      if (gate.shortReason) lines.push("", gate.shortReason);
+    } else if (gate.error) {
+      lines.push(`Error: ${gate.error}`);
+    }
+    return lines.join("\n");
+  }
+
+  async function handleSpikeAfterGemini({ entry, eventId, runnerKey, signalRowId, tradeSkipped, ctx }) {
+    if (GEMINI_GATE_TRADES) {
+      patchValidationGeminiGate(eventId, signalRowId, { pending: true });
+      panelApi?.render?.(getViewState(), { liveOnly: true });
+
+      let gate = { approved: false, error: "Gemini review failed" };
+      try {
+        gate = await requestGeminiTradeApproval(entry, ctx, signalRowId);
+      } catch (error) {
+        gate = { approved: false, error: error?.message || "Gemini review failed" };
+      }
+      patchValidationGeminiGate(eventId, signalRowId, gate);
+
+      // Always notify on Telegram after Gemini review — including blocks.
+      if (settings.telegramAlertsEnabled) {
+        await sendTelegramAlert(
+          formatGeminiGateMessage(entry, gate, Boolean(gate.approved)),
+          gate.approved ? "gemini-approved" : "gemini-blocked"
+        );
+      }
+
+      panelApi?.render?.(getViewState());
+      if (!gate.approved) return;
+
+      if (tradeSkipped) {
+        const row = findValidationRow(eventId, signalRowId);
+        if (row) {
+          const conf =
+            gate.confidence != null && Number.isFinite(gate.confidence)
+              ? ` (${Math.round(gate.confidence * 100)}%)`
+              : "";
+          row.notes = `Gemini approved: ${gate.classification}${conf} — no trade (position open)`;
+          void saveValidationStore();
+        }
+        return;
+      }
+    } else {
+      void geminiReviewApi()?.reviewSpike?.(buildGeminiReviewPayload(entry, ctx, signalRowId));
+      if (tradeSkipped) return;
+    }
+
+    if (DEMO_TRADING_ENABLED) {
+      if (isAutoTradingEnabled()) {
+        tryExecuteDemoTrade(entry, eventId, runnerKey, signalRowId);
+      } else {
+        notifyManualSpike(entry);
+      }
+      return;
+    }
+
+    if (SPIKE_ALERT_TESTING) triggerSpikeAlert(entry);
+    tryOpenPaperTrade(entry, eventId, runnerKey, signalRowId);
+  }
+
+  function saveGeminiTradeResult(trade) {
+    if (!trade?.signalRowId || !trade?.eventId) return;
+    void geminiReviewApi()?.saveTradeResult?.({
+      reviewId: trade.signalRowId,
+      eventId: trade.eventId,
+      match: trade.match,
+      runner: trade.runner,
+      pnl: trade.pnl ?? null,
+      tradeId: trade.tradeId,
+      exitOdds: trade.exitOdds ?? null,
+      tradeResult: trade.result || (trade.pnl >= 0 ? "WIN" : "LOSS")
+    });
+  }
+
+  function expertRunnerOptions(fm) {
+    return (fm?.runners || []).filter((r) => r?.runnerName && !/^(the\s*)?draw$/i.test(r.runnerName));
+  }
+
+  function expertRunnerQuote(runner) {
+    return normalizeOdds(runner?.back ?? runner?.lay);
+  }
+
+  function expertFillFromMatch(runnerNameHint = null) {
+    forceTrackCurrentMatch();
+    const reduxFm = isReduxFocusedMatch(board.focusedMatch) ? board.focusedMatch : null;
+    syncLivePageMatch(reduxFm);
+    if (board.focusedMatch && reduxFm) {
+      board.focusedMatch = mergeDomWithRedux(board.focusedMatch, reduxFm);
+    }
+
+    const fm = board.focusedMatch;
+    if (!fm?.runners?.length) return null;
+
+    const runners = expertRunnerOptions(fm);
+    let runner = null;
+    if (runnerNameHint) {
+      runner =
+        fm.runners.find((r) => normalizeChartKey(r.runnerName) === normalizeChartKey(runnerNameHint)) ||
+        null;
+    }
+    if (selectedRunnerKey && String(selectedRunnerKey).startsWith(`${fm.eventId}:`)) {
+      const rk = selectedRunnerKey.slice(String(fm.eventId).length + 1);
+      runner = fm.runners.find((r) => String(r.runnerId || r.runnerName) === rk) || runner;
+    }
+    if (!runner) {
+      runner = runners.find((r) => expertRunnerQuote(r) != null) || runners[0] || fm.runners[0];
+    }
+
+    const runnerKey = String(runner?.runnerId || runner?.runnerName || "");
+    const mem = priceMemory.get(`${fm.eventId}:${runnerKey}`);
+    let newOdds = expertRunnerQuote(runner);
+    let oldOdds = normalizeOdds(mem?.history?.[0] ?? mem?.back ?? mem?.lay ?? null);
+
+    if (oldOdds == null && newOdds != null) {
+      oldOdds = Math.round((newOdds / 1.2) * 100) / 100;
+    }
+    if (oldOdds != null && newOdds == null) {
+      newOdds = oldOdds;
+    }
+
+    const spikePct =
+      oldOdds != null && newOdds != null ? pctChange(oldOdds, newOdds) : null;
+
+    const matchLabel =
+      fm.eventName && fm.eventName !== "Live match"
+        ? fm.eventName
+        : buildMatchNameFromRunners(fm.runners);
+
+    return {
+      sport: fm.sportName || detectSportFromPage().sportName,
+      tournament: fm.competitionName || scrapeCompetitionFromPage() || "—",
+      match: matchLabel,
+      market: "Match Odds",
+      runner: runner?.runnerName || "—",
+      oldOdds,
+      newOdds,
+      spikePct,
+      matchContext: scrapeLiveMatchContextFromPage(),
+      eventId: String(fm.eventId || "")
+    };
+  }
+
+  async function runExpertViewReview(payload) {
+    return geminiReviewApi()?.callGemini?.(payload) || { ok: false, error: "Gemini not loaded" };
   }
 
   function formatSpikeMessage(entry) {
@@ -2953,7 +3428,7 @@
       return false;
     }
     if (!isValidTelegramToken(token)) {
-      telegramStatus = "Bot token format looks wrong";
+      telegramStatus = `Invalid bot token — ${telegramTokenFormatHint()}`;
       panelApi?.updateTelegramStatusUi?.();
       return false;
     }
@@ -3007,7 +3482,7 @@
 
   function sendTelegramSpikeAlert(entry) {
     if (!settings.telegramAlertsEnabled) return;
-    void sendTelegramMessage(formatSpikeMessage(entry));
+    void sendTelegramAlert(formatSpikeMessage(entry), "spike-detected");
   }
 
   function telegramSettingsPayload() {
@@ -3029,13 +3504,18 @@
           remote?.telegramChatId,
           payload.telegramChatId
         );
-        if (!payload.telegramBotToken && remote?.telegramBotToken) {
-          payload.telegramBotToken = remote.telegramBotToken;
-        }
+        payload.telegramBotToken = pickTelegramToken(
+          payload.telegramBotToken,
+          remote?.telegramBotToken
+        );
         settings.telegramChatId = payload.telegramChatId;
         settings.telegramBotToken = payload.telegramBotToken;
-        await api.saveTelegramConfig(payload);
-        telegramCloudStatus = "Saved to cloud";
+        if (!isValidTelegramToken(payload.telegramBotToken)) {
+          telegramCloudStatus = "Invalid bot token — not saved to cloud";
+        } else {
+          await api.saveTelegramConfig(payload);
+          telegramCloudStatus = "Saved to cloud";
+        }
       } catch (error) {
         telegramCloudStatus = "Cloud save failed";
         console.warn("[SpikeX] Telegram cloud save:", error?.message || error);
@@ -3062,8 +3542,10 @@
       try {
         const remote = await api.loadTelegramConfig();
         if (remote) {
-          settings.telegramBotToken =
-            remote.telegramBotToken || settings.telegramBotToken;
+          settings.telegramBotToken = pickTelegramToken(
+            remote.telegramBotToken,
+            settings.telegramBotToken
+          );
           settings.telegramChatId = mergeTelegramChatIds(
             remote.telegramChatId,
             settings.telegramChatId
@@ -3072,7 +3554,12 @@
             settings.telegramAlertsEnabled = false;
           }
           await storageSet({ [TELEGRAM_STORAGE_KEY]: telegramSettingsPayload() });
-          telegramCloudStatus = remote.telegramBotToken || remote.telegramChatId ? "Loaded from cloud" : "";
+          if (!isValidTelegramToken(settings.telegramBotToken)) {
+            telegramCloudStatus = "Cloud token invalid — paste BotFather token";
+          } else {
+            telegramCloudStatus =
+              remote.telegramBotToken || remote.telegramChatId ? "Loaded from cloud" : "";
+          }
         }
       } catch (error) {
         telegramCloudStatus = "Cloud load failed — using local";
@@ -3097,7 +3584,7 @@
       bracketConfig.minOdds = bracketConfigDefaults.minOdds;
       bracketConfig.maxOdds = bracketConfigDefaults.maxOdds;
     }
-    if (SPIKE_ALERT_TESTING) {
+    if (SPIKE_ALERT_TESTING || !ODDS_BRACKET_FILTER_ENABLED) {
       bracketConfig.oddsFilterEnabled = false;
     }
   }
@@ -3118,6 +3605,7 @@
     if (PAPER_TRADING_ENABLED) await refreshSystemPaperFromCloud();
     seedDemoTradeUpdateStateFromLedger();
     refreshCricwayAccount();
+    void geminiReviewApi()?.ensureApiKey?.();
     tryEnsureOneClick(true);
     panelApi?.syncMinimized?.();
     panelApi?.render?.(getViewState());
@@ -3205,6 +3693,11 @@
               recentSpikes.unshift(entry);
               while (recentSpikes.length > 12) recentSpikes.pop();
 
+              triggerSpikeAlert(entry);
+              if (!GEMINI_GATE_TRADES) {
+                sendTelegramSpikeAlert(entry);
+              }
+
               const tradeSkipped = DEMO_TRADING_ENABLED
                 ? Boolean(demoTrader()?.canOpenTrade?.(eventId, runnerKey))
                 : getOpenTradeCount() >= getMaxOpenTrades();
@@ -3227,18 +3720,21 @@
                 paperBlockedOutsideOdds: false
               });
 
-              if (DEMO_TRADING_ENABLED) {
-                if (!tradeSkipped) {
-                  if (isAutoTradingEnabled()) {
-                    tryExecuteDemoTrade(entry, eventId, runnerKey, signalRowId);
-                  } else {
-                    notifyManualSpike(entry);
-                  }
+              void handleSpikeAfterGemini({
+                entry,
+                eventId,
+                runnerKey,
+                signalRowId,
+                tradeSkipped,
+                ctx: {
+                  eventId,
+                  matchName,
+                  runnerName,
+                  baseline,
+                  currentBack: back,
+                  spikeDelta
                 }
-              } else {
-                if (SPIKE_ALERT_TESTING || !tradeSkipped) triggerSpikeAlert(entry);
-                if (!tradeSkipped) tryOpenPaperTrade(entry, eventId, runnerKey, signalRowId);
-              }
+              });
             }
           }
         }
@@ -3269,15 +3765,17 @@
     alertFlashUntil = 0;
   }
 
-  function resetWatchState(eventId) {
-    const nextId = String(eventId || "");
-    if (watchedEventId === nextId) return;
+  function resetWatchState(eventId, fm = null) {
+    const nextKey = fm?.runners?.length ? canonicalMatchKey(fm, eventId) : String(eventId || "");
+    if (watchedMatchKey === nextKey) return;
+
     if (watchedEventId) {
       clearChartHistory(watchedEventId);
       selectedRunnerKey = null;
     }
-    watchedEventId = nextId;
     clearSpikeMemory();
+    watchedEventId = String(eventId || "");
+    watchedMatchKey = nextKey;
   }
 
   function isRunnerTradable(runner, fm) {
@@ -3303,7 +3801,7 @@
     if (onDetail && fm?.eventId && fm?.runners?.length) {
       updateTabMatchContext(fm);
       syncValidationForMatch(fm.eventId, fm.eventName);
-      resetWatchState(fm.eventId);
+      resetWatchState(fm.eventId, fm);
     }
 
     if (onDetail && fm?.runners?.length) {
@@ -3740,6 +4238,7 @@
     const watch = getSpikeWatchStatus(fm);
     const activeSport = getSportBracket(fm?.sportName, fm?.sportId);
     const activeOdds = getOddsLimits(fm?.sportName, fm?.sportId);
+    const oddsBracketLabel = getOddsBracketLabel(fm?.sportName, fm?.sportId);
     const b = state.bracket || getBracketMetrics();
     const tg = formatTelegramStatusShort(state);
     const om = fm?.eventId
@@ -3757,15 +4256,16 @@
             <tr><th>Trades</th><td>${rp.trades}</td></tr>
             <tr><th>Matches</th><td>${rp.matches}</td></tr>
             <tr><th>Closed</th><td>${rp.closed}/${rp.closedTarget}</td></tr>
-            <tr><th>In bracket</th><td>${watch.inBracket}/${watch.total} runners</td></tr>
-            <tr><th>Spike memory</th><td>${watch.memoryReady}/${watch.inBracket || watch.total} ready (3 ticks)</td></tr>
+            <tr><th>Spike bar</th><td>≥${getMinSpikePct(fm?.sportName, fm?.sportId)}% · ${MEMORY_DEPTH} ticks · ${GEMINI_GATE_TRADES ? `Gemini gate ON · conf ≥${Math.round(GEMINI_MIN_APPROVE_CONFIDENCE * 100)}%` : "Gemini gate OFF"}</td></tr>
+            <tr><th>Odds bracket</th><td>${escapeHtml(oddsBracketLabel)}${activeOdds ? ` (${activeOdds.minOdds}–${activeOdds.maxOdds})` : " — all odds"}</td></tr>
+            <tr><th>Armed</th><td>${watch.memoryReady > 0 && watch.inBracket > 0 ? '<span class="mr-ok">Yes</span>' : '<span class="mr-warn">No — need 3 ticks on in-bracket runners</span>'}</td></tr>
             <tr><th>Odds memory</th><td>${oddsMemoryLabel}</td></tr>
             <tr><th>Spikes seen</th><td>${state.totalSpikes ?? 0}</td></tr>
             <tr><th>Telegram</th><td>${escapeHtml(tg)}</td></tr>
           </tbody>
         </table>
         <div class="mr-bracket-grid mr-bracket-compact">
-          <span>${DEMO_TRADING_ENABLED ? `${isAutoTradingEnabled() ? '<span class="mr-ok">AUTO</span>' : '<span class="mr-warn">MANUAL</span>'} · click only · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
+          <span>${DEMO_TRADING_ENABLED ? `${isAutoTradingEnabled() ? '<span class="mr-ok">AUTO</span>' : '<span class="mr-warn">MANUAL</span>'} · ${escapeHtml(oddsBracketLabel)} · ≥${getMinSpikePct(fm?.sportName, fm?.sportId)}% · Gemini gate` : SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
           <span class="${b.totalPnl >= 0 ? "mr-ok" : "mr-warn"}">${formatInr(b.totalPnl)} · ${b.winRate.toFixed(0)}% WR</span>
         </div>
         <details class="mr-bracket-advanced">
@@ -3945,6 +4445,7 @@
           <div class="mr-stat"><span class="mr-stat-k">TG</span><span class="mr-stat-v mr-stat-tg">OFF</span></div>
           <button type="button" class="mr-trading-toggle" title="Toggle auto/manual trading">AUTO</button>
           <button type="button" class="mr-alerts-toggle" title="Toggle Telegram alerts">ALERTS ON</button>
+          <button type="button" class="mr-expert-open" title="Gemini expert spike review">EXPERT</button>
           <button type="button" class="mr-export-json" disabled title="Export signal log JSON">JSON</button>
         </div>
         <button type="button" class="mr-toggle" aria-label="Collapse panel" title="Collapse">▾</button>
@@ -3957,6 +4458,61 @@
           <div class="mr-table-wrap mr-board-wrap"></div>
           <div class="mr-validation-wrap"></div>
         </div>
+        <details class="mr-settings mr-panel" data-panel="expert">
+          <summary class="mr-panel-summary">
+            <span class="mr-panel-title">Expert View</span>
+            <span class="mr-panel-badge mr-expert-badge">Gemini</span>
+          </summary>
+          <div class="mr-panel-body">
+            <section class="mr-expert">
+              <p class="mr-expert-hint">Gemini classifies spikes as <strong>EMOTIONAL_OVERREACTION</strong> vs <strong>JUSTIFIED_REPRICING</strong>. Auto-trades only fire on <strong>EMOTIONAL_OVERREACTION</strong>. Use this panel to test manually.</p>
+              <div class="mr-expert-grid">
+                <label class="mr-expert-field">
+                  Sport
+                  <input type="text" class="mr-expert-sport" placeholder="Football" />
+                </label>
+                <label class="mr-expert-field">
+                  Tournament
+                  <input type="text" class="mr-expert-tournament" placeholder="FIFA World Cup 2026" />
+                </label>
+                <label class="mr-expert-field mr-expert-span2">
+                  Match
+                  <input type="text" class="mr-expert-match" placeholder="Canada v Bosnia" />
+                </label>
+                <label class="mr-expert-field">
+                  Market
+                  <input type="text" class="mr-expert-market" value="Match Odds" />
+                </label>
+                <label class="mr-expert-field">
+                  Runner
+                  <input type="text" class="mr-expert-runner" placeholder="Canada" list="mr-expert-runners" />
+                  <datalist id="mr-expert-runners"></datalist>
+                </label>
+                <label class="mr-expert-field">
+                  Old odds
+                  <input type="number" class="mr-expert-old-odds" min="1.01" step="0.01" placeholder="2.38" />
+                </label>
+                <label class="mr-expert-field">
+                  New odds
+                  <input type="number" class="mr-expert-new-odds" min="1.01" step="0.01" placeholder="3.05" />
+                </label>
+                <label class="mr-expert-field">
+                  Spike %
+                  <input type="number" class="mr-expert-spike-pct" step="0.1" placeholder="28.1" />
+                </label>
+              </div>
+              <label class="mr-expert-field mr-expert-context">
+                Match context (optional)
+                <textarea class="mr-expert-context-input" rows="4" placeholder="Score, momentum, cards, team news — anything you know about the live match situation."></textarea>
+              </label>
+              <div class="mr-expert-actions">
+                <button type="button" class="mr-expert-fill">Fill from match</button>
+                <button type="button" class="mr-expert-run">Run Expert Review</button>
+              </div>
+              <pre class="mr-expert-result" hidden></pre>
+            </section>
+          </div>
+        </details>
         <details class="mr-settings mr-panel" data-panel="telegram">
           <summary class="mr-panel-summary">
             <span class="mr-panel-title">Telegram</span>
@@ -3968,7 +4524,7 @@
                 <input type="checkbox" class="mr-telegram-enabled" checked />
                 Alerts on
               </label>
-              <p class="mr-telegram-hint">Token &amp; chat IDs save to cloud — same on every browser. Each person must open your bot and tap <strong>Start</strong>. One chat ID per line.</p>
+              <p class="mr-telegram-hint">Bot token from <strong>@BotFather</strong> — format <code>123456789:ABCdef...</code> (not your login password). Token &amp; chat IDs save to cloud. Each person must open your bot and tap <strong>Start</strong>. One chat ID per line.</p>
               <p class="mr-telegram-cloud"></p>
               <label class="mr-telegram-field">
                 Bot token
@@ -4011,6 +4567,7 @@
     const tradingToggleBtn = root.querySelector(".mr-trading-toggle");
     const alertsToggleBtn = root.querySelector(".mr-alerts-toggle");
     const exportJsonBtn = root.querySelector(".mr-export-json");
+    const expertOpenBtn = root.querySelector(".mr-expert-open");
     const mainScroll = root.querySelector(".mr-main-scroll");
     const boardWrap = root.querySelector(".mr-board-wrap");
     const bracketWrap = root.querySelector(".mr-bracket-wrap");
@@ -4024,6 +4581,99 @@
     const telegramTestEl = root.querySelector(".mr-telegram-test");
     const telegramStatusEl = root.querySelector(".mr-telegram-status");
     const telegramCloudEl = root.querySelector(".mr-telegram-cloud");
+    const expertPanelEl = root.querySelector('[data-panel="expert"]');
+    const expertSportEl = root.querySelector(".mr-expert-sport");
+    const expertTournamentEl = root.querySelector(".mr-expert-tournament");
+    const expertMatchEl = root.querySelector(".mr-expert-match");
+    const expertMarketEl = root.querySelector(".mr-expert-market");
+    const expertRunnerEl = root.querySelector(".mr-expert-runner");
+    const expertOldOddsEl = root.querySelector(".mr-expert-old-odds");
+    const expertNewOddsEl = root.querySelector(".mr-expert-new-odds");
+    const expertSpikePctEl = root.querySelector(".mr-expert-spike-pct");
+    const expertContextEl = root.querySelector(".mr-expert-context-input");
+    const expertFillBtn = root.querySelector(".mr-expert-fill");
+    const expertRunBtn = root.querySelector(".mr-expert-run");
+    const expertResultEl = root.querySelector(".mr-expert-result");
+    const expertRunnersList = root.querySelector("#mr-expert-runners");
+
+    function readExpertPayload() {
+      const oldOdds = normalizeOdds(expertOldOddsEl.value);
+      const newOdds = normalizeOdds(expertNewOddsEl.value);
+      let spikePct = Number(expertSpikePctEl.value);
+      if (!Number.isFinite(spikePct) && oldOdds != null && newOdds != null) {
+        spikePct = pctChange(oldOdds, newOdds);
+      }
+      return {
+        sport: expertSportEl.value.trim() || "—",
+        tournament: expertTournamentEl.value.trim() || "—",
+        match: expertMatchEl.value.trim() || "—",
+        market: expertMarketEl.value.trim() || "Match Odds",
+        runner: expertRunnerEl.value.trim() || "—",
+        oldOdds,
+        newOdds,
+        spikePct,
+        matchContext: expertContextEl.value.trim(),
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    function fillExpertForm(data) {
+      if (!data) return false;
+      expertSportEl.value = data.sport || "";
+      expertTournamentEl.value = data.tournament || "";
+      expertMatchEl.value = data.match || "";
+      expertMarketEl.value = data.market || "Match Odds";
+      expertRunnerEl.value = data.runner || "";
+      expertOldOddsEl.value = data.oldOdds != null ? Number(data.oldOdds).toFixed(2) : "";
+      expertNewOddsEl.value = data.newOdds != null ? Number(data.newOdds).toFixed(2) : "";
+      expertSpikePctEl.value =
+        data.spikePct != null && Number.isFinite(data.spikePct) ? Number(data.spikePct).toFixed(1) : "";
+      if (data.matchContext != null) expertContextEl.value = data.matchContext;
+      return true;
+    }
+
+    function syncExpertRunnerList() {
+      if (!expertRunnersList) return;
+      const fm = board.focusedMatch;
+      expertRunnersList.innerHTML = expertRunnerOptions(fm)
+        .map((r) => `<option value="${escapeHtml(r.runnerName || "")}"></option>`)
+        .join("");
+    }
+
+    function showExpertResult(text, isError = false) {
+      if (!expertResultEl) return;
+      expertResultEl.hidden = false;
+      expertResultEl.textContent = text;
+      expertResultEl.classList.toggle("mr-expert-result-err", isError);
+    }
+
+    function mergeExpertFill(data) {
+      if (!data) return false;
+      const ctx = expertContextEl?.value || "";
+      fillExpertForm({ ...data, matchContext: ctx || data.matchContext || "" });
+      return Boolean(data.oldOdds != null && data.newOdds != null);
+    }
+
+    function openExpertPanel() {
+      if (!expertPanelEl) return;
+      expertPanelEl.open = true;
+      uiPanelState.expert = true;
+      saveUiPanelState();
+      syncExpertRunnerList();
+      const hint = expertRunnerEl?.value?.trim() || null;
+      const data = expertFillFromMatch(hint);
+      const filled = mergeExpertFill(data);
+      if (filled && data) {
+        showExpertResult(`Tracking ${data.match} · ${data.tournament} · ${data.sport}.`, false);
+      } else if (!filled) {
+        showExpertResult("Open a match page, then click Fill from match.", true);
+      }
+      expertContextEl?.focus();
+    }
+
+    function syncExpertPanelOpen() {
+      if (expertPanelEl) expertPanelEl.open = isPanelOpen("expert");
+    }
 
     function syncPaperInputs() {
       /* Paper trading locked ON by Bracket v1 */
@@ -4034,6 +4684,94 @@
       if (!eventId || exportJsonBtn.disabled) return;
       void copyValidationJson(eventId, exportJsonBtn);
     });
+
+    expertOpenBtn?.addEventListener("click", () => {
+      openExpertPanel();
+    });
+
+    expertFillBtn?.addEventListener("click", () => {
+      syncExpertRunnerList();
+      const hint = expertRunnerEl?.value?.trim() || null;
+      const data = expertFillFromMatch(hint);
+      const filled = mergeExpertFill(data);
+      if (!filled) showExpertResult("Open a match page with live odds first.", true);
+      else showExpertResult(`Tracking ${data.match} · ${data.tournament}.`, false);
+    });
+
+    expertPanelEl?.addEventListener("toggle", () => {
+      if (!expertPanelEl?.open) return;
+      syncExpertRunnerList();
+      const hint = expertRunnerEl?.value?.trim() || null;
+      mergeExpertFill(expertFillFromMatch(hint));
+    });
+
+    expertRunBtn?.addEventListener("click", async () => {
+      let payload = readExpertPayload();
+      if (payload.oldOdds == null || payload.newOdds == null) {
+        const hint = expertRunnerEl?.value?.trim() || null;
+        mergeExpertFill(expertFillFromMatch(hint));
+        payload = readExpertPayload();
+      }
+      if (payload.oldOdds == null || payload.newOdds == null) {
+        showExpertResult(
+          "No live odds found. Open a match page → Fill from match → or type old/new odds manually.",
+          true
+        );
+        return;
+      }
+      if (!Number.isFinite(payload.spikePct)) {
+        showExpertResult("Enter spike % or valid old/new odds.", true);
+        return;
+      }
+
+      expertRunBtn.disabled = true;
+      expertRunBtn.textContent = "Reviewing…";
+      showExpertResult("Asking Gemini…");
+
+      try {
+        const key = await geminiReviewApi()?.ensureApiKey?.();
+        if (!key) {
+          showExpertResult("Gemini API key missing — add geminiApiKey to Firestore spikex/config.", true);
+          return;
+        }
+
+        const result = await runExpertViewReview(payload);
+        if (!result?.ok) {
+          showExpertResult(`Error: ${result?.error || "Gemini failed"}`, true);
+          return;
+        }
+
+        const conf =
+          result.confidence != null ? `${Math.round(result.confidence * 100)}%` : "—";
+        showExpertResult(
+          [
+            `Classification: ${result.classification}`,
+            `Confidence: ${conf}`,
+            result.model ? `Model: ${result.model}` : "",
+            "",
+            result.shortReason || "—"
+          ]
+            .filter(Boolean)
+            .join("\n")
+        );
+      } catch (error) {
+        showExpertResult(`Error: ${error?.message || error}`, true);
+      } finally {
+        expertRunBtn.disabled = false;
+        expertRunBtn.textContent = "Run Expert Review";
+      }
+    });
+
+    for (const el of [expertOldOddsEl, expertNewOddsEl]) {
+      el?.addEventListener("input", () => {
+        const oldOdds = normalizeOdds(expertOldOddsEl.value);
+        const newOdds = normalizeOdds(expertNewOddsEl.value);
+        if (oldOdds != null && newOdds != null) {
+          const spike = pctChange(oldOdds, newOdds);
+          if (spike != null) expertSpikePctEl.value = spike.toFixed(1);
+        }
+      });
+    }
 
     boardWrap.addEventListener("click", (event) => {
       const row = event.target.closest("tr[data-runner-key]");
@@ -4086,8 +4824,10 @@
 
     function readTelegramFromInputs() {
       settings.telegramAlertsEnabled = telegramEnabledEl.checked;
-      settings.telegramBotToken = telegramTokenEl.value.trim();
-      settings.telegramChatId = telegramChatEl.value.trim();
+      const token = telegramTokenEl.value.trim();
+      const chat = telegramChatEl.value.trim();
+      if (token) settings.telegramBotToken = token;
+      if (chat) settings.telegramChatId = chat;
     }
 
     function scheduleTelegramSave() {
@@ -4160,6 +4900,8 @@
       if (settingsEl) {
         settingsEl.open = isPanelOpen("telegram");
       }
+      syncExpertPanelOpen();
+      syncExpertRunnerList();
     }
 
     tradingToggleBtn?.addEventListener("click", () => {
@@ -4197,7 +4939,7 @@
       telegramStatus = "Testing…";
       updateTelegramStatusUi();
       await saveTelegramSettings();
-      void sendTelegramMessage(formatSpikeMessage(buildTelegramTestSpikeEntry()));
+      await sendTelegramAlert(formatSpikeMessage(buildTelegramTestSpikeEntry()), "test");
     });
 
     function applyConsoleHeight() {
@@ -4390,6 +5132,83 @@
   function nudge() {
     document.dispatchEvent(new CustomEvent("market-radar-nudge"));
   }
+
+  window.__spikexSpikeDebug = () => {
+    const fm = board.focusedMatch;
+    const watch = getSpikeWatchStatus(fm);
+    const limits = getOddsLimits(fm?.sportName, fm?.sportId);
+    const memory = {};
+    if (fm?.eventId) {
+      for (const runner of fm.runners || []) {
+        const rk = String(runner.runnerId || runner.runnerName);
+        const key = `${fm.eventId}:${rk}`;
+        const mem = priceMemory.get(key);
+        memory[runner.runnerName] = {
+          back: runner.back,
+          lay: runner.lay,
+          inBracket: runnerInBracket(runner, fm.sportName, fm.sportId),
+          history: mem?.history || [],
+          historyLen: mem?.history?.length || 0,
+          armed: (mem?.history?.length || 0) >= MEMORY_DEPTH
+        };
+      }
+    }
+    const out = {
+      onDetailPage: isOnMatchDetailPage(),
+      storeConnected,
+      eventId: fm?.eventId || null,
+      matchKey: watchedMatchKey,
+      sport: fm?.sportName,
+      minSpikePct: getMinSpikePct(fm?.sportName, fm?.sportId),
+      oddsBracket: limits,
+      oddsFilterOn: bracketConfig.oddsFilterEnabled,
+      geminiGate: GEMINI_GATE_TRADES,
+      geminiMinConfidence: GEMINI_MIN_APPROVE_CONFIDENCE,
+      watch,
+      totalSpikes,
+      recentSpikes: recentSpikes.slice(0, 5),
+      memory,
+      tips: []
+    };
+    if (!out.onDetailPage) out.tips.push("Open a match detail page (Match Odds visible).");
+    if (watch.inBracket === 0 && limits) {
+      out.tips.push(`All runners outside odds bracket ${limits.minOdds}–${limits.maxOdds} — no spikes will fire.`);
+    }
+    if (watch.memoryReady === 0 && watch.inBracket > 0) {
+      out.tips.push("Need 3 back-odds ticks per runner before spikes can fire — wait for price moves.");
+    }
+    if (watch.inBracket > 0 && watch.memoryReady > 0) {
+      out.tips.push("Watching — waiting for ≥" + out.minSpikePct + "% move from oldest of last 3 ticks.");
+    }
+    console.log("[SpikeX spike debug]", out);
+    return out;
+  };
+
+  window.__spikexTelegramDebug = async () => {
+    await ensureTelegramConfigured();
+    const out = {
+      alertsEnabled: settings.telegramAlertsEnabled,
+      hasToken: Boolean(settings.telegramBotToken.trim()),
+      tokenValid: isValidTelegramToken(normalizeTelegramToken(settings.telegramBotToken)),
+      chatIds: parseTelegramChatIds(settings.telegramChatId),
+      configured: hasTelegramConfigured(),
+      lastStatus: telegramStatus,
+      cloudStatus: telegramCloudStatus
+    };
+    console.log("[SpikeX Telegram debug]", out);
+    if (out.configured && out.alertsEnabled) {
+      const test = await sendTelegramAlert("SpikeX Telegram test — config OK.", "debug-test");
+      out.testSend = test;
+      console.log("[SpikeX Telegram debug] test send:", test);
+    }
+    return out;
+  };
+
+  window.__spikexMatchContext = () => {
+    const text = scrapeLiveMatchContextFromPage();
+    console.log("[SpikeX match context]", text || "(empty — open a live match detail page)");
+    return text;
+  };
 
   window.__spikexOddsMemory = {
     stats: getOddsMemoryStats,

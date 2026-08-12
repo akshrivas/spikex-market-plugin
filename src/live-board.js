@@ -847,6 +847,7 @@
     return {
       eventId: normalizeEventId(event.eventId || ""),
       eventName: event.eventName || event.customEventName || getPageMatchHint() || "Unknown",
+      competitionName: event.competitionName || catalog.selectedCompetition?.name || "",
       status: event.status || "unknown",
       isLive: isLiveEvent(event),
       sportId: located.sportId,

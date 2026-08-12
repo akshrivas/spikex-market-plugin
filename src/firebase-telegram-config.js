@@ -68,6 +68,8 @@
       telegramAlertsEnabled: raw.telegramAlertsEnabled !== false,
       telegramBotToken: String(raw.telegramBotToken || "").trim(),
       telegramChatId: String(raw.telegramChatId || "").trim(),
+      geminiApiKey: String(raw.geminiApiKey || "").trim(),
+      geminiModel: String(raw.geminiModel || "").trim(),
       updatedAt: raw.updatedAt || null
     };
   }

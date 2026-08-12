@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Market Radar",
-  "version": "4.3.4",
-  "description": "SpikeX — spike detection, 1-click demo trading, cashout exits, Telegram alerts",
+  "version": "4.5.1",
+  "description": "SpikeX — Gemini-gated spike trading, expert review, demo trading, Telegram alerts",
   "permissions": ["storage"],
   "host_permissions": [
     "https://api.telegram.org/*",
-    "https://firestore.googleapis.com/*"
+    "https://firestore.googleapis.com/*",
+    "https://generativelanguage.googleapis.com/*"
   ],
   "content_scripts": [
     {
@@ -26,7 +27,7 @@
         "*://cricway.io/*",
         "*://cricway.com/*"
       ],
-      "js": ["src/odds-detect.js", "src/firebase-telegram-config.js", "src/firebase-odds.js", "src/demo-trader.js", "src/market-radar.js"],
+      "js": ["src/odds-detect.js", "src/firebase-telegram-config.js", "src/firebase-odds.js", "src/firebase-gemini.js", "src/gemini-review.js", "src/demo-trader.js", "src/market-radar.js"],
       "css": ["styles/panel.css"],
       "run_at": "document_idle"
     }
