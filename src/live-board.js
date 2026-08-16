@@ -964,7 +964,9 @@
         trackSportName: focusedMatch?.sportName || sportLabel(catalog.selectedEventType?.id, catalog.eventTypes) || "—",
         liveCount: focusedMatch ? 1 : 0,
         betFairWSConnected: Boolean(catalog.betFairWSConnected),
+        sportsRadarWSConnected: Boolean(catalog.sportsRadarWSConnected),
         secondaryMapSize: Object.keys(catalog.secondaryMatchOddsMap || {}).length,
+        scorecard: catalog.scorecard ?? null,
         focusedMatch,
         groups: [],
         reduxDebug: {
@@ -972,7 +974,12 @@
           urlIds,
           slug: eventSlugFromPage(),
           marketSource: focusedMatch?.source || null,
-          runnerCount: focusedMatch?.runners?.length || 0
+          runnerCount: focusedMatch?.runners?.length || 0,
+          scorecardType: catalog.scorecard == null ? "null" : typeof catalog.scorecard,
+          scorecardKeys:
+            catalog.scorecard && typeof catalog.scorecard === "object"
+              ? Object.keys(catalog.scorecard).slice(0, 40)
+              : []
         }
       };
     }
@@ -1034,7 +1041,9 @@
       trackSportName: sportId ? sportLabel(sportId, catalog.eventTypes) : "All sports",
       liveCount,
       betFairWSConnected: Boolean(catalog.betFairWSConnected),
+      sportsRadarWSConnected: Boolean(catalog.sportsRadarWSConnected),
       secondaryMapSize: Object.keys(catalog.secondaryMatchOddsMap || {}).length,
+      scorecard: catalog.scorecard ?? null,
       focusedMatch,
       groups: orderedGroups
     };
@@ -1103,4 +1112,56 @@
   });
 
   document.addEventListener("market-radar-nudge", tryConnect);
+
+  // Page-console helpers for match context / Redux scorecard availability.
+  if (!window.__spikexMatchContext) {
+    window.__spikexMatchContext = () =>
+      new Promise((resolve) => {
+        const timer = window.setTimeout(() => {
+          window.removeEventListener("message", onMessage);
+          console.warn(
+            "[SpikeX match context] no reply — reload extension, hard-refresh tab, ensure Market Radar panel is visible"
+          );
+          resolve(null);
+        }, 2500);
+
+        function onMessage(event) {
+          if (event.source !== window) return;
+          if (event.data?.source !== "spikex-cs") return;
+          if (event.data?.type !== "match-context-result") return;
+          window.clearTimeout(timer);
+          window.removeEventListener("message", onMessage);
+          const payload = event.data.payload || null;
+          console.log("[SpikeX match context]", payload);
+          resolve(payload);
+        }
+
+        window.addEventListener("message", onMessage);
+        window.postMessage({ source: "spikex-page", type: "match-context-request" }, "*");
+      });
+  }
+
+  window.__spikexDumpScorecard = () => {
+    const store = window.__marketRadarCachedStore;
+    if (!store?.getState) {
+      console.warn("[SpikeX] Redux store not found yet");
+      return null;
+    }
+    const catalog = store.getState().catalog || {};
+    const out = {
+      scorecard: catalog.scorecard ?? null,
+      scorecardType: catalog.scorecard == null ? "null" : typeof catalog.scorecard,
+      scorecardKeys:
+        catalog.scorecard && typeof catalog.scorecard === "object"
+          ? Object.keys(catalog.scorecard)
+          : [],
+      sportsRadarWSConnected: Boolean(catalog.sportsRadarWSConnected),
+      betFairWSConnected: Boolean(catalog.betFairWSConnected),
+      selectedEventId: catalog.selectedEvent?.id || null,
+      premiumIframe: Boolean(catalog.premiumIframe),
+      sportbookIframe: Boolean(catalog.sportbookIframe)
+    };
+    console.log("[SpikeX Redux scorecard dump]", out);
+    return out;
+  };
 })();

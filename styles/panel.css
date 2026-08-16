@@ -917,8 +917,35 @@ body.mr-console-resizing {
 
 .mr-validation-toolbar {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
-  margin-bottom: 2px;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.mr-clear-signals,
+.mr-clear-signals-all {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font: inherit;
+  font-size: 8px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: #111;
+  border: 1px solid #333;
+  color: #888;
+  cursor: pointer;
+}
+
+.mr-clear-signals:hover:not(:disabled),
+.mr-clear-signals-all:hover {
+  color: #fecaca;
+  border-color: #7f1d1d;
+}
+
+.mr-clear-signals:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .mr-val-copy-json {
@@ -1466,13 +1493,14 @@ body.mr-console-resizing {
 
 .mr-validation-toolbar {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   margin-bottom: 8px;
 }
 
 .mr-validation-summary {
+  margin-right: auto;
   font-size: 10px;
   color: #94a3b8;
   line-height: 1.4;

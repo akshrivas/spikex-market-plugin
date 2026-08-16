@@ -37,7 +37,7 @@
       label: "Football",
       minOdds: 2.5,
       maxOdds: 10.0,
-      minSpikePct: 20,
+      minSpikePct: 10,
       note: "Noisier flow; higher spike bar; draw/runners can sit 8–10"
     }),
     other: Object.freeze({
@@ -52,18 +52,25 @@
   const PAPER_TRADING_ENABLED = false;
   const DEMO_TRADING_ENABLED = true;
 
-  /** Phase 2: spike → trade only when Gemini classifies EMOTIONAL_OVERREACTION. */
-  const GEMINI_GATE_TRADES = true;
+  /** Gemini is optional (Expert panel). Auto spike path is rule-only — no API. */
+  const GEMINI_ON_AUTO_SPIKE = false;
+  const GEMINI_GATE_TRADES = false;
   const GEMINI_APPROVE_CLASSIFICATION = "EMOTIONAL_OVERREACTION";
-  /** Reject approvals below this confidence (insufficient-info replies use ≤0.3). */
-  const GEMINI_MIN_APPROVE_CONFIDENCE = 0.5;
+  const GEMINI_MIN_APPROVE_CONFIDENCE = 0.75;
 
   const SPIKE_ALERT_TESTING = false;
-  /** Testing: disable 2.5–8 cricket odds bracket so spikes fire at any price. */
-  const ODDS_BRACKET_FILTER_ENABLED = false;
+  /** Mid-range odds only — longshots/favorites skip. */
+  const ODDS_BRACKET_FILTER_ENABLED = true;
   const MEMORY_DEPTH = 3;
-  const SPIKE_COOLDOWN_MS = BRACKET.SPIKE_COOLDOWN_MS;
+  const SPIKE_COOLDOWN_MS = 180000;
   const SPIKE_MIN_PCT = 20;
+  /** Bigger than this is suspend/scrape junk (e.g. 187 → 3.05), not a trade. */
+  const SPIKE_MAX_PCT = 40;
+  const SANE_ODDS_MIN = 1.2;
+  const SANE_ODDS_MAX = 20;
+  const MAX_SIGNALS_PER_MATCH = 1;
+  const MATCH_SIGNAL_GAP_MS = 300000;
+  const TELEGRAM_DEMO_UPDATES = false;
   const TEST_MAX_OPEN_TRADES = 25;
   const ALERT_FLASH_MS = 6000;
   const TELEGRAM_STORAGE_KEY = "marketRadar.telegram";
@@ -87,7 +94,7 @@
     oddsFilterEnabled: ODDS_BRACKET_FILTER_ENABLED,
     overrideSportOdds: false,
     minOdds: BRACKET.MIN_ODDS,
-    maxOdds: 20
+    maxOdds: BRACKET.MAX_ODDS
   };
 
   let bracketConfig = { ...bracketConfigDefaults };
@@ -111,8 +118,9 @@
 
   const PAPER_STARTING_BANKROLL = BRACKET.STARTING_BANKROLL;
   const PAPER_POSITION_PCT = BRACKET.POSITION_PCT;
-  const PAPER_TARGET_PCT = BRACKET.TARGET_PCT;
-  const PAPER_STOP_PCT = BRACKET.STOP_PCT;
+  /** ~12% odds move ≈ 10–15% on stake (BACK: entry/exit−1). */
+  const PAPER_TARGET_PCT = 0.12;
+  const PAPER_STOP_PCT = 0.06;
 
   const settings = {
     telegramAlertsEnabled: true,
@@ -208,22 +216,24 @@
   function normalizeTelegramChatId(chatId) {
     const raw = String(chatId || "").trim();
     if (!raw) return "";
-    if (/^-?\d+$/.test(raw)) return Number(raw);
-    return raw;
+    if (/^-?\d{6,}$/.test(raw)) return raw;
+    return "";
   }
 
   function parseTelegramChatIds(raw) {
     const ids = [];
     const seen = new Set();
+    const normalized = String(raw || "")
+      .replace(/[\n\r;]+/g, ",")
+      .split(",");
 
-    for (const part of String(raw || "").split(/[\s,;]+/)) {
+    for (const part of normalized) {
       const token = part.trim();
       if (!token) continue;
-      const normalized = normalizeTelegramChatId(token);
-      const key = String(normalized);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      ids.push(normalized);
+      const id = normalizeTelegramChatId(token);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
     }
 
     return ids;
@@ -234,13 +244,12 @@
     const seen = new Set();
     for (const raw of sources) {
       for (const id of parseTelegramChatIds(raw)) {
-        const key = String(id);
-        if (seen.has(key)) continue;
-        seen.add(key);
+        if (seen.has(id)) continue;
+        seen.add(id);
         merged.push(id);
       }
     }
-    return merged.map(String).join("\n");
+    return merged.join(", ");
   }
 
   function cloudConfigApi() {
@@ -295,6 +304,11 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function isSaneMatchOdds(price) {
+    const p = normalizeOdds(price);
+    return p != null && p >= SANE_ODDS_MIN && p <= SANE_ODDS_MAX;
+  }
+
   function resolveSportKind(sportName, sportId) {
     const name = String(sportName || "").toLowerCase();
     const id = String(sportId || "");
@@ -334,10 +348,8 @@
     applyTradingSettings(data[TRADING_STORAGE_KEY]);
   }
 
-  function getMinSpikePct(sportName, sportId) {
-    if (DEMO_TRADING_ENABLED) return SPIKE_MIN_PCT;
-    if (SPIKE_ALERT_TESTING) return SPIKE_MIN_PCT;
-    return getSportBracket(sportName, sportId).minSpikePct;
+  function getMinSpikePct() {
+    return SPIKE_MIN_PCT;
   }
 
   function getOddsLimits(sportName, sportId) {
@@ -651,16 +663,43 @@
       '[class*="live-score" i]',
       '[class*="LiveScore" i]',
       '[class*="match-info" i]',
-      '[class*="MatchInfo" i]',
-      '[class*="innings" i]',
-      '[class*="Innings" i]'
+      '[class*="MatchInfo" i]'
     ];
+
+    const isFancyMarketLine = (line) =>
+      /\b(?:over\s+runs?|odd\s*even|last\s*digit|run\s*bhav|fall\s*of\s*wicket|session|fancy|bookmaker|tied\s*match|completed\s*match|toss|boundary\s*bhav)\b/i.test(
+        line
+      ) ||
+      /^\d+\s*over\b/i.test(line) ||
+      /\b(?:PB|PG|TSK|MINY)\b.+\b(?:over|runs?|digit|bhav)\b/i.test(line);
+
+    const isScoreSituationLine = (line) => {
+      if (isFancyMarketLine(line)) return false;
+      if (/\d+\s*\/\s*\d+(?:\s*[\(-]\s*\d+(?:\.\d+)?\s*(?:ov|overs?)?|\s+in\s+\d)/i.test(line)) {
+        return true;
+      }
+      if (/\b(?:CRR|RRR)\b\s*:?\s*\d+(?:\.\d+)?/i.test(line)) return true;
+      if (/\b(?:current|required)\s+run\s*rate\b/i.test(line)) return true;
+      if (/\bneed[s]?\s+\d+\s+runs?\s+off\s+\d+/i.test(line)) return true;
+      if (/\brequire[sd]?\s+\d+\s+(?:runs?\s+)?(?:from|off|in)\b/i.test(line)) return true;
+      if (/\btarget\s*:?\s*\d{2,4}\b/i.test(line)) return true;
+      if (/\bpartnership\b.{0,20}\d+/i.test(line)) return true;
+      if (/\byet\s+to\s+bat\b|\binnings\s+break\b|\bbatting\b.{0,30}\bbowling\b/i.test(line)) {
+        return true;
+      }
+      if (line.length <= 40 && /\b(?:HT|FT|ET)\b/.test(line) && /\d+\s*[-:]\s*\d+/.test(line)) {
+        return true;
+      }
+      return false;
+    };
 
     for (const sel of selectors) {
       for (const el of document.querySelectorAll(sel)) {
         if (el.closest("#market-radar-panel")) continue;
         const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-        if (text.length >= 8 && text.length <= 500) chunks.push(text);
+        if (text.length >= 8 && text.length <= 500 && isScoreSituationLine(text)) {
+          chunks.push(text);
+        }
       }
     }
 
@@ -670,15 +709,13 @@
       .map((line) => line.replace(/\s+/g, " ").trim())
       .filter(Boolean);
 
-    const interesting =
-      /(?:\d+\s*\/\s*\d+)|(?:\b(?:CRR|RRR|RR)\b)|(?:run\s*rate)|(?:need[s]?\s+\d+)|(?:require[sd]?\s+\d+)|(?:target\s*:?\s*\d+)|(?:\d+(?:\.\d+)?\s*(?:ov|overs?))|(?:partnership)|(?:wicket)|(?:balls?\s+(?:left|remaining))|(?:yet\s+to\s+bat)|(?:innings)|(?:\b(?:HT|FT|ET)\b)|(?:\d+\s*-\s*\d+)|(?:over\s+\d+)/i;
     const skip =
       /^(back|lay|matched|cash\s*out|loss\s*cut|deposit|withdraw|my bets|signals|trades|research|telegram|spike|gemini|odds|charts|validation|expert|alerts|manual|auto|1-click)/i;
 
     for (const line of lines) {
       if (line.length < 6 || line.length > 200) continue;
       if (skip.test(line)) continue;
-      if (interesting.test(line)) chunks.push(line);
+      if (isScoreSituationLine(line)) chunks.push(line);
     }
 
     const seen = new Set();
@@ -692,6 +729,477 @@
     }
 
     return out.join(" | ").slice(0, 1000);
+  }
+
+  function firstDefined(...vals) {
+    for (const v of vals) {
+      if (v == null || v === "") continue;
+      return v;
+    }
+    return null;
+  }
+
+  function numOrNull(v) {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function pickScorecardField(obj, keys) {
+    if (!obj || typeof obj !== "object") return null;
+    for (const key of keys) {
+      if (obj[key] != null && obj[key] !== "") return obj[key];
+    }
+    const lower = Object.fromEntries(
+      Object.entries(obj).map(([k, v]) => [String(k).toLowerCase(), v])
+    );
+    for (const key of keys) {
+      const hit = lower[String(key).toLowerCase()];
+      if (hit != null && hit !== "") return hit;
+    }
+    return null;
+  }
+
+  function decodeHtmlEntities(text) {
+    return String(text || "")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function parseScoreToken(text) {
+    const m = String(text || "").match(/(\d+)\s*\/\s*(\d+)/);
+    if (!m) return null;
+    return { score: `${m[1]}/${m[2]}`, runs: Number(m[1]), wickets: Number(m[2]) };
+  }
+
+  function parseOverToken(text) {
+    const m = String(text || "").match(/\((\d+(?:\.\d+)?)\)/);
+    return m ? m[1] : null;
+  }
+
+  function parseCrrToken(text) {
+    const m = String(text || "").match(/\bCRR\b\s*:?\s*(\d+(?:\.\d+)?)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  function parseBallEvents(overLabel, balls) {
+    const over = String(overLabel || "").replace(/^over\s+/i, "").trim();
+    return (balls || []).map((raw, i) => {
+      const token = String(raw || "").trim().toUpperCase();
+      let event = token;
+      if (token === "W" || token === "WKT" || token === "OUT") event = "WICKET";
+      else if (token === "4") event = "FOUR";
+      else if (token === "6") event = "SIX";
+      else if (token === "WD" || token === "NB" || token === "LB" || token === "B") event = token;
+      return { ball: over ? `${over}.${i + 1}` : String(i + 1), event };
+    });
+  }
+
+  function cleanPlayerName(text) {
+    let name = decodeHtmlEntities(text);
+    name = name
+      .replace(/\.cls-[\w-]+\s*\{[\s\S]*?\}/g, " ")
+      .replace(/\{[^}]*fill[^}]*\}/g, " ")
+      .replace(/\bcls-\w+\b/gi, " ")
+      .replace(/#[0-9a-f]{3,8}/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const parts = name
+      .split(/[^A-Za-z.'-]+/)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 1 && !/^(cls|svg|none|fill)$/i.test(p));
+    name = parts.join(" ").trim();
+    if (!name || name.length < 3) return "";
+    return name;
+  }
+
+  function cellPlayerName(td) {
+    if (!td) return "";
+    const clone = td.cloneNode(true);
+    for (const el of clone.querySelectorAll("style, script, svg, defs")) el.remove();
+    return cleanPlayerName(clone.textContent || "") || cleanPlayerName(td.textContent || "");
+  }
+
+  function parseCricwayScorecardHtml(html) {
+    const raw = String(html || "");
+    if (!/sc_cw-main-container|Cricket Scoreboard/i.test(raw)) return null;
+
+    let doc = null;
+    try {
+      doc = new DOMParser().parseFromString(raw, "text/html");
+    } catch {
+      doc = null;
+    }
+
+    const textOf = (root, sel) => {
+      if (!root) return "";
+      const el = root.querySelector(sel);
+      return decodeHtmlEntities(el?.textContent || "");
+    };
+
+    const desktop = doc?.querySelector(".sc_cw-header-desktop") || doc?.body || null;
+    const leftName = textOf(desktop, ".sc_cw-header-score-container-left-desktop")
+      ? decodeHtmlEntities(
+          desktop.querySelector(".sc_cw-header-grid-row-desktop .sc_cw-header-team-name-desktop")
+            ?.textContent || ""
+        )
+      : "";
+    const names = [...(desktop?.querySelectorAll(".sc_cw-header-team-name-desktop") || [])].map((el) =>
+      decodeHtmlEntities(el.textContent)
+    );
+    const teamLeft = names[0] || leftName || null;
+    const teamRight = names[1] || null;
+
+    const leftBlock = decodeHtmlEntities(
+      desktop?.querySelector(".sc_cw-header-score-container-left-desktop")?.textContent || ""
+    );
+    const rightBlock = decodeHtmlEntities(
+      desktop?.querySelector(".sc_cw-header-score-container-right-desktop")?.textContent || ""
+    );
+
+    const leftScore = parseScoreToken(leftBlock);
+    const rightScore = parseScoreToken(rightBlock);
+    const leftOvers = parseOverToken(leftBlock);
+    const rightOvers = parseOverToken(rightBlock);
+    const leftCrr = parseCrrToken(leftBlock);
+    const rightCrr = parseCrrToken(rightBlock);
+
+    const comment =
+      textOf(desktop, ".sc_cw-header-primary-comment-desktop") ||
+      textOf(doc, ".sc_cw-header-primary-comment-mobile");
+    const statusLine =
+      textOf(desktop, ".sc_cs-header-target-desktop") ||
+      textOf(doc, ".sc_cs-header-target-mobile");
+
+    const partnership = decodeHtmlEntities(
+      doc?.querySelector(".sc_cw-info-section-desktop .sc_cw-info-part-desktop")?.textContent || ""
+    );
+    let lastWicket = "";
+    for (const el of doc?.querySelectorAll(".sc_cw-info-section-desktop .sc_cw-info-part-desktop") || []) {
+      const t = decodeHtmlEntities(el.textContent);
+      if (/last\s*wicket/i.test(t)) lastWicket = t.replace(/^last\s*wicket:\s*/i, "");
+    }
+
+    const overBlocks = [...(doc?.querySelectorAll(".sc_cw-over-desktop .sc_cw-current-over-desktop") || [])];
+    const oversParsed = overBlocks.map((block) => {
+      const label = decodeHtmlEntities(block.querySelector(".sc_cw-over-part-name-desktop")?.textContent || "");
+      const balls = [...block.querySelectorAll(".sc_cw-over-part-balls")].map((el) =>
+        decodeHtmlEntities(el.textContent)
+      );
+      return { label, balls };
+    });
+    const currentOver = oversParsed[0] || null;
+    const previousOver = oversParsed[1] || null;
+    const lastOverRuns = previousOver
+      ? previousOver.balls.reduce((sum, b) => {
+          const n = Number(String(b).replace(/[^\d]/g, ""));
+          return sum + (Number.isFinite(n) ? n : 0);
+        }, 0)
+      : null;
+
+    const batsmen = [];
+    for (const table of doc?.querySelectorAll(".sc_cw-table-desktop table") || []) {
+      const header = decodeHtmlEntities(table.querySelector("thead th")?.textContent || "");
+      if (!/^batsmen$/i.test(header)) continue;
+      for (const row of table.querySelectorAll("tbody tr")) {
+        const tds = [...row.querySelectorAll(":scope > td")];
+        const name = cellPlayerName(tds[0]);
+        if (!name) continue;
+        batsmen.push({
+          name,
+          runs: numOrNull(tds[1]?.textContent),
+          balls: numOrNull(tds[2]?.textContent),
+          fours: numOrNull(tds[3]?.textContent),
+          sixes: numOrNull(tds[4]?.textContent),
+          strikeRate: numOrNull(tds[5]?.textContent)
+        });
+      }
+    }
+
+    let bowler = null;
+    for (const table of doc?.querySelectorAll(".sc_cw-table-desktop table") || []) {
+      const header = decodeHtmlEntities(table.querySelector("thead th")?.textContent || "");
+      if (!/^bowler$/i.test(header)) continue;
+      const tds = [...(table.querySelector("tbody tr")?.querySelectorAll(":scope > td") || [])];
+      const name = cellPlayerName(tds[0]);
+      if (!name) continue;
+      bowler = {
+        name,
+        overs: decodeHtmlEntities(tds[1]?.textContent || "") || null,
+        runs: numOrNull(tds[2]?.textContent),
+        maidens: numOrNull(tds[3]?.textContent),
+        wickets: numOrNull(tds[4]?.textContent),
+        economy: numOrNull(tds[5]?.textContent)
+      };
+      break;
+    }
+
+    const rightAllOut = rightScore?.wickets === 10;
+    const leftAllOut = leftScore?.wickets === 10;
+    let battingTeam = teamRight;
+    let bowlingTeam = teamLeft;
+    let battingScore = rightScore;
+    let battingOvers = rightOvers;
+    let battingCrr = rightCrr;
+    if (rightAllOut && !leftAllOut) {
+      battingTeam = teamLeft;
+      bowlingTeam = teamRight;
+      battingScore = leftScore;
+      battingOvers = leftOvers;
+      battingCrr = leftCrr;
+    } else if (!rightAllOut && leftAllOut) {
+      battingTeam = teamRight;
+      bowlingTeam = teamLeft;
+      battingScore = rightScore;
+      battingOvers = rightOvers;
+      battingCrr = rightCrr;
+    }
+
+    const leadMatch = statusLine.match(/\b(lead|trail)s?\s+by\s+(\d+)\s+runs?/i);
+    const needMatch = statusLine.match(/\bneed[s]?\s+(\d+)\s+runs?\b/i);
+    const targetMatch = statusLine.match(/\btarget\s*:?\s*(\d{2,4})\b/i);
+
+    const recentEvents = [
+      ...parseBallEvents(previousOver?.label, previousOver?.balls || []),
+      ...parseBallEvents(currentOver?.label, currentOver?.balls || [])
+    ].slice(-12);
+
+    return {
+      innings: leftAllOut || rightAllOut ? 2 : 1,
+      battingTeam: battingTeam || null,
+      bowlingTeam: bowlingTeam || null,
+      score: battingScore?.score || null,
+      overs: battingOvers || null,
+      target: targetMatch ? Number(targetMatch[1]) : null,
+      runsRequired: needMatch ? Number(needMatch[1]) : null,
+      ballsRemaining: null,
+      currentRunRate: battingCrr,
+      requiredRunRate: parseCrrToken(statusLine.replace(/CRR/i, "RRR")) || null,
+      wicketsInHand:
+        battingScore && battingScore.wickets != null ? Math.max(0, 10 - battingScore.wickets) : null,
+      lastOverRuns,
+      recentEvents: recentEvents.length ? recentEvents : null,
+      lastBall: comment || null,
+      status: statusLine || null,
+      partnership: partnership.replace(/^partnership:\s*/i, "") || null,
+      lastWicket: lastWicket || null,
+      battingTeamScore: battingScore?.score || null,
+      otherTeam: bowlingTeam
+        ? {
+            name: bowlingTeam,
+            score: (bowlingTeam === teamLeft ? leftScore : rightScore)?.score || null,
+            overs: bowlingTeam === teamLeft ? leftOvers : rightOvers,
+            currentRunRate: bowlingTeam === teamLeft ? leftCrr : rightCrr
+          }
+        : null,
+      leadBy: leadMatch ? Number(leadMatch[2]) : null,
+      leadTrail: leadMatch ? leadMatch[1].toLowerCase() : null,
+      batsmen: batsmen.length ? batsmen : null,
+      bowler,
+      currentOver: currentOver ? `${currentOver.label}: ${currentOver.balls.join(" ")}` : null,
+      source: "redux.catalog.scorecard.html"
+    };
+  }
+
+  /** Best-effort structured cricket context from Redux scorecard + DOM text. */
+  function buildStructuredMatchContext(options = {}) {
+    const raw = options.scorecard !== undefined ? options.scorecard : board.scorecard;
+    const domText = options.domText !== undefined ? options.domText : scrapeLiveMatchContextFromPage();
+    const ctx = {
+      innings: null,
+      battingTeam: null,
+      bowlingTeam: null,
+      score: null,
+      overs: null,
+      target: null,
+      runsRequired: null,
+      ballsRemaining: null,
+      currentRunRate: null,
+      requiredRunRate: null,
+      wicketsInHand: null,
+      lastOverRuns: null,
+      recentEvents: null,
+      source: null
+    };
+
+    if (typeof raw === "string" && /<html|<div class="sc_cw-/i.test(raw)) {
+      const parsed = parseCricwayScorecardHtml(raw);
+      if (parsed) return parsed;
+    }
+
+    if (raw && typeof raw === "object") {
+      ctx.source = "redux.catalog.scorecard";
+      const sc = raw.data && typeof raw.data === "object" ? { ...raw, ...raw.data } : raw;
+
+      ctx.innings = numOrNull(
+        pickScorecardField(sc, ["innings", "inning", "inningsNumber", "currentInnings"])
+      );
+      ctx.battingTeam = firstDefined(
+        pickScorecardField(sc, ["battingTeam", "batting_team", "batTeam", "teamBatting", "batting"])
+      );
+      ctx.bowlingTeam = firstDefined(
+        pickScorecardField(sc, ["bowlingTeam", "bowling_team", "bowlTeam", "teamBowling", "bowling"])
+      );
+      ctx.score = firstDefined(
+        pickScorecardField(sc, ["score", "currentScore", "runsWickets", "displayScore"]),
+        (() => {
+          const runs = pickScorecardField(sc, ["runs", "totalRuns"]);
+          const wkts = pickScorecardField(sc, ["wickets", "wkts", "wicket"]);
+          if (runs != null && wkts != null) return `${runs}/${wkts}`;
+          return null;
+        })()
+      );
+      ctx.overs = firstDefined(
+        pickScorecardField(sc, ["overs", "over", "currentOvers", "oversBowled"])
+      );
+      ctx.target = numOrNull(pickScorecardField(sc, ["target", "targetScore", "chaseTarget"]));
+      ctx.runsRequired = numOrNull(
+        pickScorecardField(sc, ["runsRequired", "runs_required", "needRuns", "requiredRuns", "toWin"])
+      );
+      ctx.ballsRemaining = numOrNull(
+        pickScorecardField(sc, [
+          "ballsRemaining",
+          "balls_remaining",
+          "ballsLeft",
+          "remainingBalls",
+          "balls"
+        ])
+      );
+      ctx.currentRunRate = numOrNull(
+        pickScorecardField(sc, ["currentRunRate", "crr", "CRR", "runRate", "currentRR"])
+      );
+      ctx.requiredRunRate = numOrNull(
+        pickScorecardField(sc, ["requiredRunRate", "rrr", "RRR", "reqRR", "requiredRR"])
+      );
+      ctx.wicketsInHand = numOrNull(
+        pickScorecardField(sc, ["wicketsInHand", "wickets_remaining", "wicketsLeft"])
+      );
+      ctx.lastOverRuns = numOrNull(
+        pickScorecardField(sc, ["lastOverRuns", "last_over_runs", "thisOverRuns"])
+      );
+      const events = pickScorecardField(sc, ["recentEvents", "lastBalls", "ballByBall", "commentary"]);
+      if (Array.isArray(events) && events.length) ctx.recentEvents = events.slice(0, 12);
+
+      if (ctx.score && ctx.wicketsInHand == null) {
+        const m = String(ctx.score).match(/(\d+)\s*\/\s*(\d+)/);
+        if (m) ctx.wicketsInHand = Math.max(0, 10 - Number(m[2]));
+      }
+
+      // nested home/away shapes
+      if (!ctx.score) {
+        const batting = sc.batting || sc.battingTeamStats || sc.currentBatting || null;
+        if (batting && typeof batting === "object") {
+          const runs = pickScorecardField(batting, ["runs", "score", "total"]);
+          const wkts = pickScorecardField(batting, ["wickets", "wkts"]);
+          const overs = pickScorecardField(batting, ["overs", "over"]);
+          if (runs != null && wkts != null) ctx.score = `${runs}/${wkts}`;
+          if (overs != null) ctx.overs = String(overs);
+          if (!ctx.battingTeam) {
+            ctx.battingTeam = firstDefined(pickScorecardField(batting, ["name", "team", "teamName"]));
+          }
+        }
+      }
+    }
+
+    if (domText) {
+      if (!ctx.source) ctx.source = "dom";
+      else ctx.source = `${ctx.source}+dom`;
+
+      if (!ctx.score) {
+        const m = domText.match(/(\d+\s*\/\s*\d+)/);
+        if (m) ctx.score = m[1].replace(/\s+/g, "");
+      }
+      if (!ctx.overs) {
+        const m = domText.match(/\((\d+(?:\.\d+)?)\s*(?:ov|overs)\)|\b(\d+(?:\.\d+)?)\s+overs?\b/i);
+        if (m) ctx.overs = m[1] || m[2];
+      }
+      if (ctx.currentRunRate == null) {
+        const m = domText.match(/\bCRR\b\s*:?\s*(\d+(?:\.\d+)?)/i);
+        if (m) ctx.currentRunRate = Number(m[1]);
+      }
+      if (ctx.requiredRunRate == null) {
+        const m = domText.match(/\bRRR\b\s*:?\s*(\d+(?:\.\d+)?)/i);
+        if (m) ctx.requiredRunRate = Number(m[1]);
+      }
+      if (ctx.target == null) {
+        const m = domText.match(/\btarget\s*:?\s*(\d{2,4})\b/i);
+        if (m) ctx.target = Number(m[1]);
+      }
+      if (ctx.runsRequired == null || ctx.ballsRemaining == null) {
+        const m = domText.match(/\bneed[s]?\s+(\d+)\s+runs?\s+off\s+(\d+)/i);
+        if (m) {
+          ctx.runsRequired = Number(m[1]);
+          ctx.ballsRemaining = Number(m[2]);
+        }
+      }
+      if (ctx.score && ctx.wicketsInHand == null) {
+        const m = String(ctx.score).match(/(\d+)\s*\/\s*(\d+)/);
+        if (m) ctx.wicketsInHand = Math.max(0, 10 - Number(m[2]));
+      }
+    }
+
+    const hasAny = Object.entries(ctx).some(([k, v]) => k !== "source" && v != null);
+    return hasAny ? ctx : null;
+  }
+
+  function formatMatchContextForPrompt(matchContext) {
+    if (!matchContext) return "";
+    if (typeof matchContext === "string") return matchContext.trim();
+    try {
+      const compact = {};
+      for (const [key, value] of Object.entries(matchContext)) {
+        if (value == null || value === "") continue;
+        compact[key] = value;
+      }
+      return JSON.stringify(compact, null, 2);
+    } catch {
+      return String(matchContext);
+    }
+  }
+
+  function buildReviewContextProbe(entry = null, ctx = null) {
+    const fm = board.focusedMatch;
+    const domText = scrapeLiveMatchContextFromPage();
+    const matchContext = buildStructuredMatchContext({ domText });
+    const scorecard = board.scorecard ?? null;
+    const marketContext = {
+      previousOdds: ctx?.baseline ?? entry?.from ?? null,
+      currentOdds: entry?.to ?? ctx?.currentBack ?? null,
+      spikePercent: ctx?.spikeDelta ?? entry?.delta ?? null,
+      timestamp: new Date(entry?.at || Date.now()).toISOString()
+    };
+
+    return {
+      available: {
+        onDetailPage: isOnMatchDetailPage(),
+        reduxScorecardPresent: scorecard != null,
+        reduxScorecardType: scorecard == null ? "null" : typeof scorecard,
+        reduxScorecardKeys:
+          scorecard && typeof scorecard === "object" ? Object.keys(scorecard).slice(0, 50) : [],
+        reduxScorecardSample:
+          typeof scorecard === "string"
+            ? `html:${scorecard.length} chars`
+            : scorecard && typeof scorecard === "object"
+              ? JSON.parse(JSON.stringify(scorecard))
+              : scorecard,
+        sportsRadarWSConnected: Boolean(board.sportsRadarWSConnected),
+        betFairWSConnected: Boolean(board.betFairWSConnected),
+        domContextText: domText || null,
+        reduxDebug: board.reduxDebug || null
+      },
+      sport: entry?.sportName || fm?.sportName || detectSportFromPage().sportName,
+      tournament: entry?.tournament || fm?.competitionName || scrapeCompetitionFromPage() || "—",
+      match: entry?.matchName || fm?.eventName || resolveLiveMatchName(),
+      market: "Match Odds",
+      runner: entry?.runnerName || ctx?.runnerName || null,
+      marketContext,
+      matchContext,
+      matchContextPromptText: formatMatchContextForPrompt(matchContext) || null
+    };
   }
 
   function forceTrackCurrentMatch() {
@@ -842,7 +1350,7 @@
         competitionName:
           reduxHint?.competitionName || prev?.competitionName || scrapeCompetitionFromPage() || "",
         source: "live-page",
-        marketSuspended: false,
+        marketSuspended: runners.every((r) => r.suspended || r.back == null),
         eventSuspended: false,
         runners
       }
@@ -1183,6 +1691,10 @@
   let oddsMemorySaveTimer = null;
   let oddsMemoryPointsSinceSave = 0;
   const lastSpikeAt = new Map();
+  const matchSpikeCount = new Map();
+  const lastMatchSpikeAt = new Map();
+  const matchProfitTaken = new Set();
+  const pendingExitWatch = new Map();
   let selectedRunnerKey = null;
   let tickChanges = 0;
   let totalSpikes = 0;
@@ -1267,7 +1779,10 @@
         liveCount: data.liveCount || 0,
         groups: data.groups || [],
         betFairWSConnected: data.betFairWSConnected,
+        sportsRadarWSConnected: data.sportsRadarWSConnected,
         secondaryMapSize: data.secondaryMapSize || 0,
+        scorecard: data.scorecard !== undefined ? data.scorecard : board.scorecard ?? null,
+        reduxDebug: data.reduxDebug || board.reduxDebug || null,
         trackSportName: data.trackSportName || board.trackSportName || "All sports",
         trackSportId: data.trackSportId || board.trackSportId || null,
         pageMode: onDetail ? "detail" : data.pageMode || board.pageMode || "list",
@@ -1740,14 +2255,11 @@
     );
   }
 
-  function validationKeysForMatch(eventId, matchName) {
+  function validationKeysForMatch(eventId) {
     const keys = new Set();
     if (eventId) keys.add(String(eventId));
 
     for (const [key, match] of Object.entries(validationStore.matches)) {
-      if (matchName && matchNamesEquivalent(match.matchName, matchName)) {
-        keys.add(key);
-      }
       if (eventId && match.eventId && String(match.eventId) === String(eventId)) {
         keys.add(key);
       }
@@ -1760,7 +2272,7 @@
     const primaryKey = String(eventId || "");
     if (!primaryKey) return primaryKey;
 
-    const keys = validationKeysForMatch(primaryKey, matchName);
+    const keys = validationKeysForMatch(primaryKey);
     const primary = ensureValidationMatch(primaryKey, matchName);
     const seenIds = new Set(primary.rows.map((row) => row.id));
     let changed = false;
@@ -2021,10 +2533,9 @@
     };
   }
 
-  function validationRowsForView(eventId, matchName) {
-    if (!eventId && !matchName) return [];
-    consolidateValidationMatches(eventId, matchName);
-    const keys = validationKeysForMatch(eventId, matchName);
+  function validationRowsForView(eventId) {
+    if (!eventId) return [];
+    const keys = validationKeysForMatch(eventId);
     const seen = new Set();
     const rows = [];
 
@@ -2033,12 +2544,28 @@
       if (!match?.rows?.length) continue;
       for (const row of match.rows) {
         if (seen.has(row.id)) continue;
+        if (row.eventId && String(row.eventId) !== String(eventId)) continue;
         seen.add(row.id);
         rows.push(row);
       }
     }
 
-    return rows.sort((a, b) => a.at - b.at);
+    return rows.sort((a, b) => b.at - a.at);
+  }
+
+  function clearValidationLogs(eventId, { all = false } = {}) {
+    if (all) {
+      validationStore.matches = {};
+      validationSeq = 0;
+    } else if (eventId) {
+      const key = String(eventId);
+      if (validationStore.matches[key]) validationStore.matches[key].rows = [];
+      for (const [k, match] of Object.entries(validationStore.matches)) {
+        if (k !== key && String(match.eventId) === key) delete validationStore.matches[k];
+      }
+    }
+    void saveValidationStore();
+    panelApi?.render?.(getViewState());
   }
 
   function buildValidationJsonPayload(eventId, matchName) {
@@ -2731,18 +3258,23 @@
     alertFlashUntil = Date.now() + ALERT_FLASH_MS;
     playSpikeTone();
     panelApi?.flashHeader?.();
-    if (settings.telegramAlertsEnabled) {
-      void sendTelegramAlert(formatDemoEntryTelegram(entry, null, null, "MANUAL"), "manual-spike");
-    }
+    // Telegram is sent once from the Gemini opportunity gate, not here.
     panelApi?.render?.(getViewState());
   }
 
   function formatDemoExitTelegram(trade) {
     const levels = resolveDemoTradeLevels(trade);
-    const exitLabel =
-      trade.exitMethod === "losscut" || trade.exitSide === "LOSS CUT" ? "Loss Cut" : "Cash Out";
+    const isLossCut =
+      trade.exitMethod === "losscut" ||
+      trade.exitSide === "LOSS CUT" ||
+      /stop/i.test(String(trade.exitReason || ""));
+    const exitLabel = isLossCut ? "Loss Cut" : "Cash Out";
+    const title = isLossCut ? "🛑 LOSS CUT" : "💰 CASH OUT";
+    const stake = Number(trade.stake) || 0;
+    const pnl = Number(trade.pnl);
+    const pnlPct = stake > 0 && Number.isFinite(pnl) ? ((pnl / stake) * 100).toFixed(1) : null;
     const lines = [
-      "✅ Position Closed",
+      title,
       "",
       "Match:",
       trade.match || "—",
@@ -2750,39 +3282,29 @@
       "Selection:",
       trade.runner || "—",
       "",
-      "Trade ID:",
-      trade.tradeId,
+      "Side:",
+      trade.side || "—",
       "",
       "Entry:",
-      formatSideOrderLine(trade.side, trade.entryOdds, trade.stake),
-      "",
-      "Target:",
-      formatOdds(levels.targetOdds),
-      "",
-      "Stop:",
-      formatOdds(levels.stopOdds),
+      formatOdds(trade.entryOdds),
       "",
       "Exit:",
-      exitLabel
+      `${exitLabel} @ ${formatOdds(trade.exitOdds)}`,
+      "",
+      "Target was:",
+      formatOdds(levels.targetOdds),
+      "",
+      "Stop was:",
+      formatOdds(levels.stopOdds),
+      "",
+      "PnL:",
+      `${formatInr(trade.pnl)}${pnlPct != null ? ` (${pnlPct}% of stake)` : ""}${trade.pnlEstimated ? " (est.)" : ""}`
     ];
-    const exitAmount = trade.exitAmount ?? trade.cashoutAmount ?? trade.lossCutAmount;
-    if (exitAmount != null) {
-      lines.push("", `${exitLabel} Value:`, formatInr(exitAmount));
+    if (Number(trade.pnl) > 0) {
+      lines.push("", "Status:", "Match done — no more entries");
+    } else {
+      lines.push("", "Status:", "Stop hit — one more entry allowed if a fresh 20% spike comes");
     }
-    if (trade.exitVerified) {
-      lines.push("", "Verified:", trade.exitVerified);
-    }
-    lines.push(
-      "",
-      "Realized PnL:",
-      `${formatInr(trade.pnl)}${trade.pnlEstimated ? " (est.)" : ""}`,
-      "",
-      "Reason:",
-      trade.exitReason || "Exit",
-      "",
-      "Status:",
-      "CLOSED"
-    );
     return lines.join("\n");
   }
 
@@ -2821,10 +3343,17 @@
           stopOdds: result.trade.stopOdds,
           runner: result.trade.runner
         });
-      }
-
-      if (settings.telegramAlertsEnabled) {
-        void sendTelegramMessage(formatDemoEntryTelegram(spikeEntry, result.trade, result.error));
+      } else if (!result.ok && settings.telegramAlertsEnabled) {
+        void sendTelegramAlert(
+          [
+            "⚠️ ENTRY noted — auto click failed",
+            "",
+            result.error || "Could not place BACK/LAY",
+            "",
+            "Still watching odds for Cash Out / Loss Cut."
+          ].join("\n"),
+          "entry-click-failed"
+        );
       }
 
       panelApi?.render?.(getViewState());
@@ -2919,7 +3448,7 @@
   function checkDemoTradeUpdates(fm) {
     const dt = demoTrader();
     if (!DEMO_TRADING_ENABLED || !dt || !fm?.runners?.length || !isMarketTradable(fm)) return;
-    if (!settings.telegramAlertsEnabled) return;
+    if (!TELEGRAM_DEMO_UPDATES || !settings.telegramAlertsEnabled) return;
 
     const openTrades = dt.getOpenTrades();
     const openIds = new Set(openTrades.map((t) => t.tradeId));
@@ -2984,9 +3513,7 @@
           { manual: false }
         );
         saveGeminiTradeResult(result.trade);
-        if (settings.telegramAlertsEnabled) {
-          void sendTelegramMessage(formatDemoExitTelegram(result.trade));
-        }
+        markMatchTradeClosed(result.trade.eventId, result.trade.pnl);
       }
       if (results.length) panelApi?.render?.(getViewState());
     });
@@ -3074,7 +3601,8 @@
   }
 
   function buildGeminiReviewPayload(entry, ctx, signalRowId) {
-    const scrapedContext = scrapeLiveMatchContextFromPage();
+    const structured = buildStructuredMatchContext();
+    const matchContextText = formatMatchContextForPrompt(structured);
     return {
       reviewId: signalRowId,
       eventId: String(ctx.eventId),
@@ -3087,7 +3615,15 @@
       newOdds: entry.to ?? ctx.currentBack,
       spikePct: ctx.spikeDelta,
       timestamp: new Date(entry.at || Date.now()).toISOString(),
-      matchContext: scrapedContext || undefined
+      marketContext: {
+        previousOdds: ctx.baseline ?? null,
+        currentOdds: entry.to ?? ctx.currentBack ?? null,
+        spikePercent: ctx.spikeDelta ?? null,
+        timestamp: new Date(entry.at || Date.now()).toISOString()
+      },
+      matchContext: structured || undefined,
+      // prompt helper still accepts string; keep serialized copy for Gemini text
+      matchContextText: matchContextText || undefined
     };
   }
 
@@ -3143,7 +3679,7 @@
     if (!row) return;
 
     if (gate.pending) {
-      row.notes = "Awaiting Gemini review…";
+      row.notes = "Gemini suggestion pending…";
       void saveValidationStore();
       return;
     }
@@ -3157,19 +3693,12 @@
       gate.confidence != null && Number.isFinite(gate.confidence)
         ? ` (${Math.round(gate.confidence * 100)}%)`
         : "";
+    const reason = gate.shortReason ? ` — ${gate.shortReason.slice(0, 80)}` : "";
 
-    if (gate.approved) {
-      row.notes = `Gemini approved: ${gate.classification}${conf}`;
-    } else if (gate.error && !gate.classification) {
-      row.notes = `Trade blocked — Gemini error: ${String(gate.error).slice(0, 100)}`;
-    } else if (gate.rejectReason) {
-      const reason = gate.shortReason ? ` — ${gate.shortReason.slice(0, 80)}` : "";
-      row.notes = `Trade blocked — ${gate.classification || "Gemini"}${conf} — ${gate.rejectReason}${reason}`;
-    } else if (gate.classification === "JUSTIFIED_REPRICING") {
-      const reason = gate.shortReason ? ` — ${gate.shortReason.slice(0, 80)}` : "";
-      row.notes = `Trade blocked — ${gate.classification}${conf}${reason}`;
+    if (gate.error && !gate.classification) {
+      row.notes = `Gemini suggestion unavailable: ${String(gate.error).slice(0, 100)}`;
     } else {
-      row.notes = `Trade blocked — Gemini: ${gate.classification || "no approval"}${conf}`;
+      row.notes = `Gemini: ${gate.classification || "no classification"}${conf}${reason}`;
     }
 
     void saveValidationStore();
@@ -3206,45 +3735,28 @@
   }
 
   async function handleSpikeAfterGemini({ entry, eventId, runnerKey, signalRowId, tradeSkipped, ctx }) {
-    if (GEMINI_GATE_TRADES) {
-      patchValidationGeminiGate(eventId, signalRowId, { pending: true });
-      panelApi?.render?.(getViewState(), { liveOnly: true });
-
-      let gate = { approved: false, error: "Gemini review failed" };
-      try {
-        gate = await requestGeminiTradeApproval(entry, ctx, signalRowId);
-      } catch (error) {
-        gate = { approved: false, error: error?.message || "Gemini review failed" };
-      }
-      patchValidationGeminiGate(eventId, signalRowId, gate);
-
-      // Always notify on Telegram after Gemini review — including blocks.
-      if (settings.telegramAlertsEnabled) {
-        await sendTelegramAlert(
-          formatGeminiGateMessage(entry, gate, Boolean(gate.approved)),
-          gate.approved ? "gemini-approved" : "gemini-blocked"
-        );
-      }
-
-      panelApi?.render?.(getViewState());
-      if (!gate.approved) return;
-
-      if (tradeSkipped) {
-        const row = findValidationRow(eventId, signalRowId);
-        if (row) {
-          const conf =
-            gate.confidence != null && Number.isFinite(gate.confidence)
-              ? ` (${Math.round(gate.confidence * 100)}%)`
-              : "";
-          row.notes = `Gemini approved: ${gate.classification}${conf} — no trade (position open)`;
-          void saveValidationStore();
-        }
-        return;
-      }
-    } else {
-      void geminiReviewApi()?.reviewSpike?.(buildGeminiReviewPayload(entry, ctx, signalRowId));
-      if (tradeSkipped) return;
+    const row = findValidationRow(eventId, signalRowId);
+    if (row) {
+      const decision = entry.decision || bracketTradeHypothesis(entry.delta);
+      row.notes = `Rule: ${spikeActionLabel(decision)} · ${Number(entry.delta).toFixed(1)}% · no Gemini`;
+      void saveValidationStore();
     }
+
+    if (GEMINI_ON_AUTO_SPIKE) {
+      void (async () => {
+        patchValidationGeminiGate(eventId, signalRowId, { pending: true });
+        let gate = { approved: false, error: "Gemini review failed" };
+        try {
+          gate = await requestGeminiTradeApproval(entry, ctx, signalRowId);
+        } catch (error) {
+          gate = { approved: false, error: error?.message || "Gemini review failed" };
+        }
+        patchValidationGeminiGate(eventId, signalRowId, gate);
+        panelApi?.render?.(getViewState());
+      })();
+    }
+
+    if (tradeSkipped) return;
 
     if (DEMO_TRADING_ENABLED) {
       if (isAutoTradingEnabled()) {
@@ -3336,7 +3848,7 @@
       oldOdds,
       newOdds,
       spikePct,
-      matchContext: scrapeLiveMatchContextFromPage(),
+      matchContext: buildStructuredMatchContext(),
       eventId: String(fm.eventId || "")
     };
   }
@@ -3349,8 +3861,12 @@
     const sign = entry.delta > 0 ? "+" : "";
     const spikeDir = entry.dir === "up" ? "↑ UP" : "↓ DOWN";
     const decision = entry.decision || bracketTradeHypothesis(entry.delta);
+    const entryOdds = normalizeOdds(
+      entry.entryPrice ?? spikeEntryPrice(decision, entry.to, entry.lay)
+    );
+    const levels = calcTargetStop(decision, entryOdds);
     const lines = [
-      "🔥 SPIKE DETECTED",
+      "🔥 ENTRY",
       "",
       "Match:",
       entry.matchName || resolveLiveMatchName(),
@@ -3359,9 +3875,6 @@
 
     if (entry.sportName) {
       lines.push("Sport:", entry.sportName, "");
-    }
-    if (entry.eventId) {
-      lines.push("Event:", String(entry.eventId), "");
     }
 
     lines.push(
@@ -3374,8 +3887,17 @@
       "Move:",
       `${sign}${Number(entry.delta).toFixed(1)}% (${spikeDir})`,
       "",
-      "Hypothesis:",
-      spikeActionLabel(decision)
+      "Action:",
+      spikeActionLabel(decision),
+      "",
+      "Target (Cash Out):",
+      `${formatOdds(levels.targetOdds)}  (~${Math.round(PAPER_TARGET_PCT * 100)}% odds)`,
+      "",
+      "Stop (Loss Cut):",
+      formatOdds(levels.stopOdds),
+      "",
+      "Next alerts:",
+      "Cash Out or Loss Cut only — no more spikes this trade"
     );
 
     if (entry.pageUrl) {
@@ -3482,7 +4004,99 @@
 
   function sendTelegramSpikeAlert(entry) {
     if (!settings.telegramAlertsEnabled) return;
-    void sendTelegramAlert(formatSpikeMessage(entry), "spike-detected");
+    armExitWatch(entry);
+    void sendTelegramAlert(formatSpikeMessage(entry), "entry");
+  }
+
+  function armExitWatch(entry) {
+    const eventId = String(entry.eventId || "");
+    if (!eventId) return;
+    const side = entry.decision || bracketTradeHypothesis(entry.delta);
+    const entryOdds = normalizeOdds(
+      entry.entryPrice ?? spikeEntryPrice(side, entry.to, entry.lay)
+    );
+    const levels = calcTargetStop(side, entryOdds);
+    pendingExitWatch.set(eventId, {
+      eventId,
+      matchName: entry.matchName,
+      runnerName: entry.runnerName,
+      runnerKey: entry.runnerKey || entry.runnerName,
+      side,
+      entryOdds,
+      targetOdds: levels.targetOdds,
+      stopOdds: levels.stopOdds,
+      stake: demoEntryStake()
+    });
+  }
+
+  function checkArmedExitWatch(fm) {
+    if (!fm?.eventId || !fm.runners?.length) return;
+    const watch = pendingExitWatch.get(String(fm.eventId));
+    if (!watch) return;
+
+    const runner = findRunnerForOpenTrade(
+      { runnerKey: watch.runnerKey, runner: watch.runnerName, eventId: watch.eventId },
+      fm.runners
+    );
+    if (!runner) return;
+
+    const currentOdds =
+      watch.side === "BACK" ? runner.back : runner.lay ?? runner.back;
+    if (currentOdds == null || !Number.isFinite(currentOdds)) return;
+
+    let hit = null;
+    if (watch.side === "BACK") {
+      if (currentOdds <= watch.targetOdds) hit = "cashout";
+      else if (currentOdds >= watch.stopOdds) hit = "losscut";
+    } else if (currentOdds >= watch.targetOdds) hit = "cashout";
+    else if (currentOdds <= watch.stopOdds) hit = "losscut";
+
+    if (!hit) return;
+
+    pendingExitWatch.delete(String(fm.eventId));
+    const pnl = calcTradePnl(watch.side, watch.entryOdds, currentOdds, watch.stake);
+    markMatchTradeClosed(watch.eventId, pnl);
+    void sendTelegramAlert(
+      formatWatchExitTelegram(watch, currentOdds, hit, pnl),
+      hit === "losscut" ? "loss-cut" : "cash-out"
+    );
+  }
+
+  function formatWatchExitTelegram(watch, currentOdds, hit, pnl) {
+    const isLoss = hit === "losscut";
+    const stake = Number(watch.stake) || 0;
+    const pnlPct = stake > 0 ? ((pnl / stake) * 100).toFixed(1) : null;
+    return [
+      isLoss ? "🛑 LOSS CUT" : "💰 CASH OUT",
+      "",
+      "Match:",
+      watch.matchName || "—",
+      "",
+      "Selection:",
+      watch.runnerName || "—",
+      "",
+      "Side:",
+      watch.side,
+      "",
+      "Entry:",
+      formatOdds(watch.entryOdds),
+      "",
+      "Now:",
+      formatOdds(currentOdds),
+      "",
+      "Hit:",
+      isLoss
+        ? `Stop ${formatOdds(watch.stopOdds)}`
+        : `Target ${formatOdds(watch.targetOdds)}`,
+      "",
+      "PnL (est.):",
+      `${formatInr(pnl)}${pnlPct != null ? ` (${pnlPct}% of stake)` : ""}`,
+      "",
+      "Status:",
+      isLoss
+        ? "Stop hit — one more entry allowed if a fresh 20% spike comes"
+        : "Match done — no more entries"
+    ].join("\n");
   }
 
   function telegramSettingsPayload() {
@@ -3584,7 +4198,13 @@
       bracketConfig.minOdds = bracketConfigDefaults.minOdds;
       bracketConfig.maxOdds = bracketConfigDefaults.maxOdds;
     }
-    if (SPIKE_ALERT_TESTING || !ODDS_BRACKET_FILTER_ENABLED) {
+    if (ODDS_BRACKET_FILTER_ENABLED && !SPIKE_ALERT_TESTING) {
+      bracketConfig.oddsFilterEnabled = true;
+      if (!bracketConfig.overrideSportOdds) {
+        bracketConfig.minOdds = BRACKET.MIN_ODDS;
+        bracketConfig.maxOdds = BRACKET.MAX_ODDS;
+      }
+    } else if (SPIKE_ALERT_TESTING || !ODDS_BRACKET_FILTER_ENABLED) {
       bracketConfig.oddsFilterEnabled = false;
     }
   }
@@ -3612,11 +4232,44 @@
     panelApi?.updateCricwayBalanceUi?.();
   }
 
+  function hasOpenTradeOnMatch(eventId) {
+    const id = String(eventId || "");
+    if (!id) return false;
+    const demoOpen = demoTrader()?.getOpenTrades?.() || [];
+    if (demoOpen.some((t) => String(t.eventId) === id)) return true;
+    return getOpenTrades().some((t) => String(t.eventId) === id);
+  }
+
+  function matchSpikeQuotaOk(eventId) {
+    const id = String(eventId || "");
+    if (!id) return false;
+    if (matchProfitTaken.has(id)) return false;
+    if (hasOpenTradeOnMatch(id)) return false;
+    if ((matchSpikeCount.get(id) || 0) >= MAX_SIGNALS_PER_MATCH) return false;
+    return true;
+  }
+
+  function recordMatchSpike(eventId) {
+    const id = String(eventId || "");
+    matchSpikeCount.set(id, (matchSpikeCount.get(id) || 0) + 1);
+    lastMatchSpikeAt.set(id, Date.now());
+  }
+
+  function markMatchTradeClosed(eventId, pnl) {
+    const id = String(eventId || "");
+    if (!id) return;
+    if (Number(pnl) > 0) {
+      matchProfitTaken.add(id);
+      matchSpikeCount.set(id, MAX_SIGNALS_PER_MATCH);
+      return;
+    }
+    matchSpikeCount.set(id, 0);
+  }
+
   function triggerSpikeAlert(entry) {
     activeAlert = entry;
     alertFlashUntil = Date.now() + ALERT_FLASH_MS;
     playSpikeTone();
-    sendTelegramSpikeAlert(entry);
     panelApi?.flashHeader?.();
     window.setTimeout(() => {
       if (activeAlert === entry) activeAlert = null;
@@ -3639,8 +4292,14 @@
   ) {
     back = normalizeOdds(back);
     lay = normalizeOdds(lay);
+    if (!isSaneMatchOdds(back)) back = null;
+    if (lay != null && !isSaneMatchOdds(lay)) lay = null;
     const key = `${eventId}:${runnerKey}`;
     const prev = priceMemory.get(key) || { history: [], back: null };
+    if (prev.back != null && !isSaneMatchOdds(prev.back)) {
+      prev.back = null;
+      prev.history = [];
+    }
     let dir = null;
     let delta = null;
     let spike = false;
@@ -3661,17 +4320,32 @@
       tickChanges += 1;
 
       const history = pushHistory(prev.history, prev.back);
-      if (paperReady && spikesEnabled && history.length >= MEMORY_DEPTH) {
-        const baseline = history[0];
-        spikeDelta = pctChange(baseline, back);
-        if (spikeDelta != null && Math.abs(spikeDelta) >= minSpikePct) {
+      const vsLast = pctChange(prev.back, back);
+      const vsWindow =
+        history.length >= MEMORY_DEPTH ? pctChange(history[0], back) : null;
+      const lastHit =
+        vsLast != null &&
+        Math.abs(vsLast) >= minSpikePct &&
+        Math.abs(vsLast) <= SPIKE_MAX_PCT;
+      const windowHit =
+        vsWindow != null &&
+        Math.abs(vsWindow) >= minSpikePct &&
+        Math.abs(vsWindow) <= SPIKE_MAX_PCT;
+      spikeDelta = lastHit
+        ? vsLast
+        : windowHit
+          ? vsWindow
+          : vsLast;
+
+      if (paperReady && spikesEnabled && (lastHit || windowHit)) {
           const last = lastSpikeAt.get(key) || 0;
-          if (Date.now() - last >= SPIKE_COOLDOWN_MS) {
+          if (Date.now() - last >= SPIKE_COOLDOWN_MS && matchSpikeQuotaOk(eventId)) {
             const decision = bracketTradeHypothesis(spikeDelta);
             const entryPrice = spikeEntryPrice(decision, back, lay);
             if (isPriceInBracket(entryPrice, sportName, sportId)) {
               spike = true;
               lastSpikeAt.set(key, Date.now());
+              recordMatchSpike(eventId);
               totalSpikes += 1;
 
               const entry = buildSpikeEntry({
@@ -3680,7 +4354,8 @@
                 runnerName,
                 sportName,
                 eventId,
-                from: baseline,
+                runnerKey,
+                from: lastHit ? prev.back : history[0],
                 to: back,
                 lay,
                 delta: spikeDelta,
@@ -3694,9 +4369,7 @@
               while (recentSpikes.length > 12) recentSpikes.pop();
 
               triggerSpikeAlert(entry);
-              if (!GEMINI_GATE_TRADES) {
-                sendTelegramSpikeAlert(entry);
-              }
+              sendTelegramSpikeAlert(entry);
 
               const tradeSkipped = DEMO_TRADING_ENABLED
                 ? Boolean(demoTrader()?.canOpenTrade?.(eventId, runnerKey))
@@ -3709,7 +4382,7 @@
                 back,
                 lay,
                 history,
-                baseline,
+                baseline: lastHit ? prev.back : history[0],
                 currentBack: back,
                 spikeDelta,
                 decision,
@@ -3719,6 +4392,13 @@
                 paperBlocked: false,
                 paperBlockedOutsideOdds: false
               });
+
+              console.info(
+                "[SpikeX spike]",
+                runnerName,
+                `${formatOdds(entry.from)} → ${formatOdds(back)}`,
+                `${Number(spikeDelta).toFixed(1)}%`
+              );
 
               void handleSpikeAfterGemini({
                 entry,
@@ -3730,14 +4410,19 @@
                   eventId,
                   matchName,
                   runnerName,
-                  baseline,
+                  baseline: lastHit ? prev.back : history[0],
                   currentBack: back,
                   spikeDelta
                 }
               });
+            } else {
+              console.info(
+                "[SpikeX spike skipped] outside odds bracket",
+                runnerName,
+                formatOdds(entryPrice)
+              );
             }
           }
-        }
       }
     }
 
@@ -3747,9 +4432,9 @@
 
     if (tradable) {
       priceMemory.set(key, {
-        history: pushHistory(prev.history, back),
-        back,
-        lay
+        history: back != null ? pushHistory(prev.history, back) : prev.history,
+        back: back != null ? back : prev.back,
+        lay: lay != null ? lay : prev.lay
       });
     }
 
@@ -3766,15 +4451,15 @@
   }
 
   function resetWatchState(eventId, fm = null) {
-    const nextKey = fm?.runners?.length ? canonicalMatchKey(fm, eventId) : String(eventId || "");
-    if (watchedMatchKey === nextKey) return;
+    const nextKey = String(eventId || "");
+    if (!nextKey || watchedMatchKey === nextKey) return;
 
     if (watchedEventId) {
       clearChartHistory(watchedEventId);
       selectedRunnerKey = null;
     }
     clearSpikeMemory();
-    watchedEventId = String(eventId || "");
+    watchedEventId = nextKey;
     watchedMatchKey = nextKey;
   }
 
@@ -3806,9 +4491,8 @@
 
     if (onDetail && fm?.runners?.length) {
       const suspended = Boolean(fm.marketSuspended);
-      if (!suspended && lastMarketSuspended) {
-        clearSpikeMemory();
-      }
+      // Keep pre-suspend prices. Wickets suspend the market; wiping memory
+      // drops the jump vs the last live odds, so no spike fires on reopen.
       lastMarketSuspended = suspended;
 
       const matchState = inferMatchState(fm);
@@ -3843,6 +4527,7 @@
       recordOddsMemoryFromMatch(fm);
 
       checkDemoTradeExit(fm);
+      checkArmedExitWatch(fm);
       checkDemoTradeUpdates(fm);
       checkPaperTradeExit(fm);
       board = { ...board, pageMode: "detail", focusedMatch: fm };
@@ -4205,6 +4890,11 @@
 
     const inner = `
       <div class="mr-validation" data-event-id="${escapeHtml(eventId)}">
+        <div class="mr-validation-toolbar">
+          <span class="mr-validation-summary">${rows.length ? `${rows.length} this match · newest first` : "No signals this match"}</span>
+          <button type="button" class="mr-clear-signals" data-event-id="${escapeHtml(eventId)}" ${rows.length ? "" : "disabled"}>Clear</button>
+          <button type="button" class="mr-clear-signals-all" title="Clear stored logs for every match">Clear all</button>
+        </div>
         <div class="mr-validation-scroll">
           <table class="mr-table mr-validation-table">
             <thead>
@@ -4256,7 +4946,7 @@
             <tr><th>Trades</th><td>${rp.trades}</td></tr>
             <tr><th>Matches</th><td>${rp.matches}</td></tr>
             <tr><th>Closed</th><td>${rp.closed}/${rp.closedTarget}</td></tr>
-            <tr><th>Spike bar</th><td>≥${getMinSpikePct(fm?.sportName, fm?.sportId)}% · ${MEMORY_DEPTH} ticks · ${GEMINI_GATE_TRADES ? `Gemini gate ON · conf ≥${Math.round(GEMINI_MIN_APPROVE_CONFIDENCE * 100)}%` : "Gemini gate OFF"}</td></tr>
+            <tr><th>Spike bar</th><td>≥${getMinSpikePct()}% · odds ${BRACKET.MIN_ODDS}–${BRACKET.MAX_ODDS} · 1 entry/match · then Cash Out / Loss Cut only · target ~${Math.round(PAPER_TARGET_PCT * 100)}%</td></tr>
             <tr><th>Odds bracket</th><td>${escapeHtml(oddsBracketLabel)}${activeOdds ? ` (${activeOdds.minOdds}–${activeOdds.maxOdds})` : " — all odds"}</td></tr>
             <tr><th>Armed</th><td>${watch.memoryReady > 0 && watch.inBracket > 0 ? '<span class="mr-ok">Yes</span>' : '<span class="mr-warn">No — need 3 ticks on in-bracket runners</span>'}</td></tr>
             <tr><th>Odds memory</th><td>${oddsMemoryLabel}</td></tr>
@@ -4265,7 +4955,7 @@
           </tbody>
         </table>
         <div class="mr-bracket-grid mr-bracket-compact">
-          <span>${DEMO_TRADING_ENABLED ? `${isAutoTradingEnabled() ? '<span class="mr-ok">AUTO</span>' : '<span class="mr-warn">MANUAL</span>'} · ${escapeHtml(oddsBracketLabel)} · ≥${getMinSpikePct(fm?.sportName, fm?.sportId)}% · Gemini gate` : SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
+          <span>${DEMO_TRADING_ENABLED ? `${isAutoTradingEnabled() ? '<span class="mr-ok">AUTO</span>' : '<span class="mr-warn">MANUAL</span>'} · ${escapeHtml(oddsBracketLabel)} · ≥${getMinSpikePct()}% · Gemini suggest` : SPIKE_ALERT_TESTING ? `<span class="mr-warn">TESTING</span> · all odds · ≥${SPIKE_MIN_PCT}% · ${MEMORY_DEPTH} ticks` : `${escapeHtml(activeSport.label)} ${activeOdds ? `${activeOdds.minOdds}–${activeOdds.maxOdds}` : "—"} · ≥${activeSport.minSpikePct}% · LOCKED`}</span>
           <span class="${b.totalPnl >= 0 ? "mr-ok" : "mr-warn"}">${formatInr(b.totalPnl)} · ${b.winRate.toFixed(0)}% WR</span>
         </div>
         <details class="mr-bracket-advanced">
@@ -4465,7 +5155,7 @@
           </summary>
           <div class="mr-panel-body">
             <section class="mr-expert">
-              <p class="mr-expert-hint">Gemini classifies spikes as <strong>EMOTIONAL_OVERREACTION</strong> vs <strong>JUSTIFIED_REPRICING</strong>. Auto-trades only fire on <strong>EMOTIONAL_OVERREACTION</strong>. Use this panel to test manually.</p>
+              <p class="mr-expert-hint">Gemini classifies spikes as <strong>EMOTIONAL_OVERREACTION</strong> vs <strong>JUSTIFIED_REPRICING</strong>. This is a suggestion only — it does not block trades or Telegram.</p>
               <div class="mr-expert-grid">
                 <label class="mr-expert-field">
                   Sport
@@ -4524,7 +5214,7 @@
                 <input type="checkbox" class="mr-telegram-enabled" checked />
                 Alerts on
               </label>
-              <p class="mr-telegram-hint">Bot token from <strong>@BotFather</strong> — format <code>123456789:ABCdef...</code> (not your login password). Token &amp; chat IDs save to cloud. Each person must open your bot and tap <strong>Start</strong>. One chat ID per line.</p>
+              <p class="mr-telegram-hint">Bot token from <strong>@BotFather</strong> — format <code>123456789:ABCdef...</code>. Chat IDs are <strong>comma-separated</strong>. Each person must open your bot and tap <strong>Start</strong>.</p>
               <p class="mr-telegram-cloud"></p>
               <label class="mr-telegram-field">
                 Bot token
@@ -4532,7 +5222,7 @@
               </label>
               <label class="mr-telegram-field">
                 Chat IDs
-                <textarea class="mr-telegram-chat" rows="3" placeholder="1327411160&#10;1248568854" autocomplete="off"></textarea>
+                <textarea class="mr-telegram-chat" rows="3" placeholder="1327411160, 1248568854" autocomplete="off"></textarea>
               </label>
               <div class="mr-telegram-actions">
                 <button type="button" class="mr-telegram-test">Test</button>
@@ -4683,6 +5373,27 @@
       const eventId = exportJsonBtn.dataset.eventId;
       if (!eventId || exportJsonBtn.disabled) return;
       void copyValidationJson(eventId, exportJsonBtn);
+    });
+
+    validationWrap.addEventListener("click", (event) => {
+      const clearAll = event.target.closest(".mr-clear-signals-all");
+      if (clearAll) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (window.confirm("Clear signal logs for every match?")) {
+          clearValidationLogs(null, { all: true });
+        }
+        return;
+      }
+      const clearOne = event.target.closest(".mr-clear-signals");
+      if (!clearOne || clearOne.disabled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const eventId = clearOne.dataset.eventId;
+      if (!eventId) return;
+      if (window.confirm("Clear signal log for this match?")) {
+        clearValidationLogs(eventId);
+      }
     });
 
     expertOpenBtn?.addEventListener("click", () => {
@@ -5205,10 +5916,22 @@
   };
 
   window.__spikexMatchContext = () => {
-    const text = scrapeLiveMatchContextFromPage();
-    console.log("[SpikeX match context]", text || "(empty — open a live match detail page)");
-    return text;
+    const payload = buildReviewContextProbe();
+    console.log("[SpikeX match context]", payload);
+    return payload;
   };
+
+  // Page console ("top") can't see content-script window.* — bridge via postMessage.
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    if (event.data?.source !== "spikex-page") return;
+    if (event.data?.type !== "match-context-request") return;
+    const payload = buildReviewContextProbe();
+    window.postMessage(
+      { source: "spikex-cs", type: "match-context-result", payload, at: Date.now() },
+      "*"
+    );
+  });
 
   window.__spikexOddsMemory = {
     stats: getOddsMemoryStats,

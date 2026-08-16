@@ -65,7 +65,17 @@
   function buildPrompt(payload) {
     const spikePct = Number(payload.spikePct);
     const spikeStr = Number.isFinite(spikePct) ? spikePct.toFixed(1) : String(payload.spikePct ?? "—");
-    const matchContext = String(payload.matchContext || "").trim();
+    const matchContextRaw = payload.matchContextText || payload.matchContext || "";
+    const matchContext =
+      typeof matchContextRaw === "string"
+        ? matchContextRaw.trim()
+        : (() => {
+            try {
+              return JSON.stringify(matchContextRaw, null, 2);
+            } catch {
+              return String(matchContextRaw || "").trim();
+            }
+          })();
     const hasMatchContext = Boolean(matchContext);
 
     return [
@@ -74,7 +84,7 @@
       "Do not use outside knowledge, live score lookups, or assumed match events.",
       "Do not invent scorecard details, momentum, wickets, boundaries, goals, red cards, or news.",
       hasMatchContext
-        ? "Operator-provided match context is present — you may use it along with the odds fields."
+        ? "Match context is present — you may use only the non-null fields provided."
         : "No scorecard, momentum, or recent-event data is provided — do not analyze or invent those.",
       "",
       "Provided fields:",
@@ -83,26 +93,29 @@
       `Match: ${payload.match || "—"}`,
       `Market: ${payload.market || "Match Odds"}`,
       `Runner: ${payload.runner || "—"}`,
-      `Previous odds: ${payload.oldOdds ?? "—"}`,
-      `Current odds: ${payload.newOdds ?? "—"}`,
+      `Previous odds: ${payload.oldOdds ?? payload.marketContext?.previousOdds ?? "—"}`,
+      `Current odds: ${payload.newOdds ?? payload.marketContext?.currentOdds ?? "—"}`,
       `Spike: ${spikeStr}%`,
-      `Timestamp: ${payload.timestamp || new Date().toISOString()}`,
+      `Timestamp: ${payload.timestamp || payload.marketContext?.timestamp || new Date().toISOString()}`,
       "",
       `A spike of ${spikeStr}% occurred on the specified runner.`,
       "",
-      ...(hasMatchContext
-        ? ["Additional match context from operator:", matchContext, ""]
-        : []),
+      ...(hasMatchContext ? ["Match context:", matchContext, ""] : []),
       "Classify the movement as:",
       "1. EMOTIONAL_OVERREACTION",
       "or",
       "2. JUSTIFIED_REPRICING",
       "",
       "Rules:",
+      "- Be conservative. Default to JUSTIFIED_REPRICING unless the spike looks clearly excessive vs the provided context.",
       "- Base the classification only on the provided fields" +
-        (hasMatchContext ? " and operator match context." : "."),
+        (hasMatchContext ? " and match context." : "."),
+      "- Ignore null/empty match-context fields.",
+      "- If match context shows a wicket, dismissal, boundary burst, red card, or similar event that aligns with the odds move, classify JUSTIFIED_REPRICING.",
+      "- EMOTIONAL_OVERREACTION only when the odds jump looks larger than the provided on-field facts support, or the facts do not explain a move this size.",
+      "- Use high confidence (≥ 0.75) only when the provided facts clearly support that call.",
       "- If the provided information is insufficient to classify confidently, say so clearly in shortReason.",
-      "- When information is insufficient, do not guess causal match events; set confidence low (≤ 0.3).",
+      "- When information is insufficient, do not guess causal match events; set classification to JUSTIFIED_REPRICING and confidence low (≤ 0.3).",
       "- You must still return one of the two classification values.",
       "",
       "Return JSON only:",
@@ -272,7 +285,11 @@
       tradeId: extra.tradeId || null,
       geminiModel: review?.model || null,
       geminiError: extra.geminiError || null,
-      matchContext: payload.matchContext ? String(payload.matchContext).slice(0, 1000) : null
+      matchContext: payload.matchContext
+        ? typeof payload.matchContext === "string"
+          ? payload.matchContext.slice(0, 2000)
+          : JSON.stringify(payload.matchContext).slice(0, 2000)
+        : null
     };
   }
 
@@ -292,7 +309,7 @@
 
     const saved = await cloudGeminiApi()?.saveGeminiReview?.(eventId, reviewId, record);
     return {
-      ok: gemini.ok && saved?.ok !== false,
+      ok: gemini.ok,
       review: gemini.ok ? gemini : null,
       saved,
       error: gemini.ok ? saved?.error : gemini.error
